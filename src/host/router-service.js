@@ -271,8 +271,12 @@ export class RouterService {
   async collect(project, options = {}) {
     const store = this.storeFor(project);
     const state = await store.read();
-    const summaries =
-      options.summaries ?? (await this.reader.listProject(project));
+    // `state()` lists every Session once and shares the snapshot. Filter it
+    // here: the tree and the untracked list are per-project, and passing the
+    // global list straight through leaked other workspaces' sessions.
+    const summaries = options.summaries
+      ? options.summaries.filter((summary) => sameProject(summary.cwd, project))
+      : await this.reader.listProject(project);
     const cutoff = Date.now() - (Number(state.tracking.days) || this.config.firstRunDays) * DAY;
     const candidates = summaries
       .filter((summary) => !this.isRouterSummary(summary, state))

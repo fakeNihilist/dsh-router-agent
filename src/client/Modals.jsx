@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useState } from 'react';
 import { CloseIcon, HistoryIcon, SettingsIcon } from './icons.jsx';
+import { Select } from './Select.jsx';
 
 function tokens(value) {
   if (value === null || value === undefined) return '—';
@@ -58,41 +59,41 @@ export function SettingsModal({ settings, models, onSave, onClose }) {
       <div className="dra-modal-body">
         <div className="dra-field">
           <label htmlFor="dra-layout">节点排列方式</label>
-          <select id="dra-layout" className="dra-select" value={layout} onChange={(event) => setLayout(event.target.value)}>
-            <option value="vertical">纵向 · 根从左到右，分叉向下</option>
-            <option value="horizontal">横向 · 根从上到下，分叉向右</option>
-          </select>
+          <Select
+            id="dra-layout"
+            value={layout}
+            onChange={setLayout}
+            options={[
+              { value: 'vertical', label: '纵向 · 根从左到右，分叉向下' },
+              { value: 'horizontal', label: '横向 · 根从上到下，分叉向右' },
+            ]}
+            ariaLabel="节点排列方式"
+          />
         </div>
         <div className="dra-field">
           <label htmlFor="dra-ra-model">RA 模型</label>
-          <select id="dra-ra-model" className="dra-select" value={ra} onChange={(event) => setRa(event.target.value)}>
-            <option value="">跟随部署默认</option>
-            {groups.map((group) => (
-              <optgroup key={group.id} label={group.name ?? group.id}>
-                {group.models.map((model) => (
-                  <option key={`${group.id}|${model.id}`} value={`${group.id}|${model.id}`}>
-                    {model.name ?? model.id}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
+          <Select
+            id="dra-ra-model"
+            value={ra}
+            onChange={setRa}
+            options={[{ value: '', label: '跟随部署默认' }]}
+            groups={modelGroups(groups)}
+            ariaLabel="RA 模型"
+            menuMinWidth={260}
+          />
           <div className="dra-field-help">只影响 Router 会话，不改变整个部署的默认模型。</div>
         </div>
         <div className="dra-field">
           <label htmlFor="dra-new-model">新会话默认模型</label>
-          <select id="dra-new-model" className="dra-select" value={fresh} onChange={(event) => setFresh(event.target.value)}>
-            <option value="">跟随部署默认</option>
-            {groups.map((group) => (
-              <optgroup key={group.id} label={group.name ?? group.id}>
-                {group.models.map((model) => (
-                  <option key={`${group.id}|${model.id}`} value={`${group.id}|${model.id}`}>
-                    {model.name ?? model.id}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
+          <Select
+            id="dra-new-model"
+            value={fresh}
+            onChange={setFresh}
+            options={[{ value: '', label: '跟随部署默认' }]}
+            groups={modelGroups(groups)}
+            ariaLabel="新会话默认模型"
+            menuMinWidth={260}
+          />
           <div className="dra-field-help">只用于 Router 新建的会话；已有会话保持原模型。</div>
         </div>
         {groups.length === 0 ? <div className="dra-error">没有可用的模型目录，模型设置暂时不可用。</div> : null}
@@ -179,13 +180,32 @@ export function HistoryModal({ ra, history, onClose, onRefresh }) {
 }
 
 export function UntrackedModal({ items, onRestore, onClose }) {
-  const [busyId, setBusyId] = useState(null);
-  const restore = async (id) => {
-    setBusyId(id);
+  const [selected, setSelected] = useState(() => new Set());
+  const [busy, setBusy] = useState(false);
+  const list = items ?? [];
+  const chosen = list.filter((item) => selected.has(item.sessionId));
+  const allChecked = list.length > 0 && chosen.length === list.length;
+  const toggle = (sessionId, checked) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (checked) next.add(sessionId);
+      else next.delete(sessionId);
+      return next;
+    });
+  };
+  const toggleAll = () => {
+    setSelected(allChecked ? new Set() : new Set(list.map((item) => item.sessionId)));
+  };
+  const restore = async () => {
+    if (!chosen.length) return;
+    setBusy(true);
     try {
-      await onRestore?.(id);
+      await onRestore?.(chosen.map((item) => item.sessionId));
+      onClose?.();
+    } catch {
+      // Parent surfaces the error; keep the ticks so the user can retry.
     } finally {
-      setBusyId(null);
+      setBusy(false);
     }
   };
   return (
@@ -193,32 +213,60 @@ export function UntrackedModal({ items, onRestore, onClose }) {
       <Head title="未跟踪会话" onClose={onClose} />
       <div className="dra-modal-body">
         <div className="dra-field-help" style={{ marginBottom: 10 }}>
-          默认只跟踪最近一周的会话。停止跟踪的会话也会出现在这里；恢复后重新进入 RA 的上下文。
+          勾选同意恢复的会话；恢复后会重新进入 RA 的上下文。默认只跟踪最近一周的会话，手动停止跟踪的会话也会出现在这里。
         </div>
-        {items.length === 0 ? (
+        {list.length === 0 ? (
           <div className="dra-field-help">没有未跟踪的会话。</div>
         ) : (
           <div className="dra-list">
-            {items.map((item) => (
-              <div className="dra-list-row" key={item.sessionId}>
-                <div className="dra-grow">
-                  <div className="dra-list-title">{item.title}</div>
-                  <div className="dra-list-sub">
-                    {item.reason === 'stopped' ? '手动停止跟踪' : '一周前'} · 最后活跃 {item.lastActiveLabel}
+            {list.map((item) => {
+              const checked = selected.has(item.sessionId);
+              return (
+                <label className="dra-list-row dra-check-row" data-checked={checked ? 'true' : 'false'} key={item.sessionId}>
+                  <input
+                    type="checkbox"
+                    className="dra-check"
+                    checked={checked}
+                    disabled={busy}
+                    onChange={(event) => toggle(item.sessionId, event.target.checked)}
+                    aria-label={`恢复 ${item.title}`}
+                  />
+                  <div className="dra-grow">
+                    <div className="dra-list-title">{item.title}</div>
+                    <div className="dra-list-sub">
+                      {item.reason === 'stopped' ? '手动停止跟踪' : '一周前'} · 最后活跃 {item.lastActiveLabel}
+                    </div>
                   </div>
-                </div>
-                <button
-                  className="dra-btn dra-btn-sm"
-                  type="button"
-                  disabled={busyId === item.sessionId}
-                  onClick={() => restore(item.sessionId)}
-                >
-                  {busyId === item.sessionId ? '恢复中…' : '恢复'}
-                </button>
-              </div>
-            ))}
+                </label>
+              );
+            })}
           </div>
         )}
+      </div>
+      <div className="dra-modal-foot">
+        <button
+          className="dra-btn dra-btn-ghost dra-btn-sm"
+          type="button"
+          disabled={busy || list.length === 0}
+          onClick={toggleAll}
+        >
+          {allChecked ? '取消全选' : '全选'}
+        </button>
+        <span className="dra-modal-count">
+          已勾选 {chosen.length} / {list.length}
+        </span>
+        <span className="dra-spacer" />
+        <button className="dra-btn" type="button" onClick={onClose} disabled={busy}>
+          取消
+        </button>
+        <button
+          className="dra-btn dra-btn-primary"
+          type="button"
+          disabled={!chosen.length || busy}
+          onClick={restore}
+        >
+          {busy ? '恢复中…' : chosen.length ? `恢复所选（${chosen.length}）` : '恢复所选'}
+        </button>
       </div>
     </Mask>
   );
@@ -363,6 +411,16 @@ export function Toast({ message }) {
 
 function modelValue(value) {
   return value?.provider && value?.model ? `${value.provider}|${value.model}` : '';
+}
+
+function modelGroups(groups) {
+  return (groups ?? []).map((group) => ({
+    label: group.name ?? group.id,
+    options: (group.models ?? []).map((model) => ({
+      value: `${group.id}|${model.id}`,
+      label: model.name ?? model.id,
+    })),
+  }));
 }
 
 function parseModel(value) {

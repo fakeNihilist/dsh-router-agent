@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { CloseIcon, CompressIcon, StopIcon } from './icons.jsx';
+import { Select } from './Select.jsx';
 
 function tokens(value) {
   if (value === null || value === undefined) return '—';
@@ -44,7 +45,7 @@ export function Detail({
       <div className="dra-detail-head">
         {editing ? (
           <input
-            className="dra-select dra-grow"
+            className="dra-input dra-grow"
             value={title}
             autoFocus
             onChange={(event) => setTitle(event.target.value)}
@@ -87,20 +88,19 @@ export function Detail({
         {session.boundaries?.length ? (
           <>
             <div className="dra-detail-row">
-              <select
-                className="dra-select dra-grow"
+              <Select
+                className="dra-grow"
                 value={String(boundary)}
-                onChange={(event) => onSelectAtSeq?.(session.sessionId, Number(event.target.value))}
+                onChange={(next) => onSelectAtSeq?.(session.sessionId, Number(next))}
+                options={session.boundaries.map((item) => ({
+                  value: String(item.atSeq),
+                  label: `T${item.turn} · ${item.label}`,
+                }))}
                 disabled={!pendingFork}
                 title={pendingFork ? '更换 RA 提议的分叉点' : '等 RA 提出分叉后再选择'}
-                aria-label="分叉点"
-              >
-                {session.boundaries.map((item) => (
-                  <option key={item.atSeq} value={String(item.atSeq)}>
-                    T{item.turn} · {item.label}
-                  </option>
-                ))}
-              </select>
+                ariaLabel="分叉点"
+                menuMinWidth={240}
+              />
             </div>
             <div className="dra-field-help">
               {session.boundaryCount > (session.boundaries?.length ?? 0)

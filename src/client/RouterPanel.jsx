@@ -4,6 +4,7 @@ import { Canvas } from './Canvas.jsx';
 import { Composer } from './Composer.jsx';
 import { Detail } from './Detail.jsx';
 import { ProposalCard } from './ProposalCard.jsx';
+import { Select } from './Select.jsx';
 import { HistoryIcon, MoreIcon, RouterIcon, SearchIcon, SettingsIcon } from './icons.jsx';
 import {
   CompressModal,
@@ -17,6 +18,12 @@ import {
 import { boundsOf, buildLayout, centerOn, clamp, fitSelection } from './layout.js';
 
 const POLL_MS = 2200;
+
+/** Space kept free at the bottom of the canvas for the composer stack. */
+function fitReserve(composerTop, pending) {
+  if (composerTop > 0) return composerTop + 12;
+  return pending ? 390 : 230;
+}
 
 export function RouterPanel({ openSession }) {
   const [data, setData] = useState(null);
@@ -35,8 +42,13 @@ export function RouterPanel({ openSession }) {
   const [view, setView] = useState({ x: 0, y: 0, z: 1 });
   const [viewport, setViewport] = useState({ width: 900, height: 700 });
   const [newIds, setNewIds] = useState(() => new Set());
+  const [composerTop, setComposerTop] = useState(0);
   const viewportRef = useRef(viewport);
   viewportRef.current = viewport;
+  const panelRef = useRef(null);
+  const composerRef = useRef(null);
+  const composerTopRef = useRef(0);
+  composerTopRef.current = composerTop;
   const dataRef = useRef(data);
   dataRef.current = data;
   const historySeen = useRef(new Set());
@@ -121,6 +133,26 @@ export function RouterPanel({ openSession }) {
         ? '还没有可路由的项目会话。'
         : '';
 
+  // The composer floats over the canvas. Measuring the whole stack (proposal
+  // card + input) lets the zoom controls and the fit logic stay clear of it at
+  // any panel size, including the narrow side-panel layout.
+  const measureComposer = useCallback(() => {
+    const panel = panelRef.current;
+    const composer = composerRef.current;
+    if (!panel || !composer) return;
+    const next = Math.max(0, Math.round(panel.getBoundingClientRect().bottom - composer.getBoundingClientRect().top));
+    setComposerTop((current) => (Math.abs(current - next) > 1 ? next : current));
+  }, []);
+
+  useEffect(() => {
+    const element = composerRef.current;
+    if (!element) return undefined;
+    const observer = new ResizeObserver(measureComposer);
+    observer.observe(element);
+    measureComposer();
+    return () => observer.disconnect();
+  }, [measureComposer]);
+
   // Fit on the first paint of a project/layout, and again when the container
   // size settles (the first ResizeObserver reading arrives after the panel is
   // mounted). Later polls and newly added sessions do not move the viewport.
@@ -129,7 +161,9 @@ export function RouterPanel({ openSession }) {
     const key = `${data.selectedProject.project}|${layoutMode}`;
     if (fitKey.current === key) return;
     fitKey.current = key;
-    const fitted = fitSelection(layout, viewportRef.current, layoutMode, { bottomReserve: pending ? 390 : 230 });
+    const fitted = fitSelection(layout, viewportRef.current, layoutMode, {
+      bottomReserve: fitReserve(composerTopRef.current, pending),
+    });
     lastFit.current = fitted;
     setView(fitted);
   }, [data?.selectedProject, layoutMode, layout.nodes.length, pending]);
@@ -137,6 +171,7 @@ export function RouterPanel({ openSession }) {
   const handleViewport = useCallback(
     (next) => {
       setViewport(next);
+      measureComposer();
       setView((current) => {
         const fitted = lastFit.current;
         if (
@@ -146,7 +181,7 @@ export function RouterPanel({ openSession }) {
           Math.abs(current.z - fitted.z) < 0.001
         ) {
           const replacement = fitSelection(layoutRef.current, next, layoutMode, {
-            bottomReserve: pendingRef.current ? 390 : 230,
+            bottomReserve: fitReserve(composerTopRef.current, pendingRef.current),
           });
           lastFit.current = replacement;
           return replacement;
@@ -154,7 +189,7 @@ export function RouterPanel({ openSession }) {
         return current;
       });
     },
-    [layoutMode],
+    [layoutMode, measureComposer],
   );
 
   // Detect a new auto-executed dispatch row and surface it once.
@@ -264,11 +299,14 @@ export function RouterPanel({ openSession }) {
     if (selectedId === session.sessionId) setSelectedId(null);
   };
 
-  const restore = async (sessionId) => {
-    await run(
-      () => apiOp('restore', { project: data.selectedProject.project, sessionId }),
-      '已恢复跟踪。',
-    ).catch(() => {});
+  const restoreMany = async (ids) => {
+    const list = Array.isArray(ids) ? ids : [];
+    if (!list.length) return;
+    await run(async () => {
+      for (const sessionId of list) {
+        await apiOp('restore', { project: data.selectedProject.project, sessionId });
+      }
+    }, list.length === 1 ? '已恢复跟踪。' : `已恢复 ${list.length} 个会话。`);
   };
 
   const rename = async (sessionId, title) => {
@@ -295,8 +333,9 @@ export function RouterPanel({ openSession }) {
     const bounds = boundsOf(layout.nodes, layout.nodeW, layout.nodeH);
     const width = viewport.width;
     const height = viewport.height;
+    const reserve = fitReserve(composerTopRef.current, pending);
     const z = clamp(
-      Math.min((width - 60) / Math.max(1, bounds.width), (height - (pending ? 390 : 230)) / Math.max(1, bounds.height)),
+      Math.min((width - 60) / Math.max(1, bounds.width), (height - reserve) / Math.max(1, bounds.height)),
       0.25,
       1.4,
     );
@@ -332,31 +371,30 @@ export function RouterPanel({ openSession }) {
     : null;
 
   return (
-    <div className="dra">
+    <div className="dra" ref={panelRef} style={{ '--dra-composer-top': `${composerTop}px` }}>
       <header className="dra-header">
         <div className="dra-brand">
           <RouterIcon />
           <span>Router</span>
         </div>
-        <label className="dra-project" title={data?.selectedProject?.project ?? '选择一个项目'}>
-          <select
-            value={data?.selectedProject?.project ?? ''}
-            onChange={(event) => {
-              setProject(event.target.value);
-              setSelectedId(null);
-              fitKey.current = '';
-            }}
-            aria-label="项目"
-          >
-            {(data?.projects ?? []).length === 0 ? <option value="">无项目</option> : null}
-            {(data?.projects ?? []).map((row) => (
-              <option key={row.project} value={row.project}>
-                {row.name} · {row.sessions}
-              </option>
-            ))}
-          </select>
-          <span className="dra-caret">▾</span>
-        </label>
+        <Select
+          className="dra-project"
+          value={data?.selectedProject?.project ?? ''}
+          onChange={(next) => {
+            setProject(next);
+            setSelectedId(null);
+            fitKey.current = '';
+          }}
+          options={(data?.projects ?? []).map((row) => ({
+            value: row.project,
+            label: `${row.name} · ${row.sessions}`,
+          }))}
+          placeholder={(data?.projects ?? []).length === 0 ? '无项目' : '选择项目'}
+          disabled={(data?.projects ?? []).length === 0}
+          ariaLabel="项目"
+          title={data?.selectedProject?.project ?? '选择一个项目'}
+          menuMinWidth={260}
+        />
         <div className="dra-search">
           <SearchIcon width={14} height={14} />
           <input
@@ -407,7 +445,13 @@ export function RouterPanel({ openSession }) {
           />
         ) : (
           <div className="dra-empty">
-            <h3>{loading ? '正在读取项目…' : data?.selectedProject ? '这个项目还没有可跟踪的会话' : '还没有项目'}</h3>
+            <h3>
+              {loading
+                ? '正在读取项目…'
+                : data?.selectedProject
+                  ? '这个项目还没有可跟踪的会话'
+                  : '还没有项目'}
+            </h3>
             <p>
               {data?.selectedProject
                 ? '默认只跟踪最近 7 天有活动的会话。可以去“未跟踪会话”恢复更早的会话，或先在 DSH 中继续一个会话。'
@@ -439,7 +483,7 @@ export function RouterPanel({ openSession }) {
           />
         ) : null}
 
-        <div className="dra-composer-wrap">
+        <div className="dra-composer-wrap" ref={composerRef}>
           {pendingList.length > 0 ? (
             <div className="dra-proposals">
               {pendingList.map((proposal) => {
@@ -513,10 +557,7 @@ export function RouterPanel({ openSession }) {
       {modal === 'untracked' ? (
         <UntrackedModal
           items={data?.untracked ?? []}
-          onRestore={async (id) => {
-            await restore(id);
-            setModal(null);
-          }}
+          onRestore={restoreMany}
           onClose={() => setModal(null)}
         />
       ) : null}

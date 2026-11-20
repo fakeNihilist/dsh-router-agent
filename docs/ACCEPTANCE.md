@@ -36,7 +36,7 @@
 | 26 | 详情无概览/血缘 | ✅ | UI 测试断言 `doesNotMatch(/概览|血缘|一句话/)` |
 | 27 | 停止跟踪 | ✅ | `stop parent...`；确认弹层；未跟踪恢复 |
 | 28 | 父子停止语义 | ✅ | `stop parent makes child root; restore reattaches`；真实 UI 截图 |
-| 29 | 未跟踪列表 | ✅ | `05-untracked`；reason `stopped/older`；恢复 |
+| 29 | 未跟踪列表 | ✅ | `05-untracked`；reason `stopped/older`；只含当前选中项目；勾选同意后批量恢复，未勾选时按钮禁用 |
 | 30 | 设置界面 | ✅ | 布局/RA/新会话模型三项；`settings persist...`；UI 选项存在，模型组依赖部署凭据 |
 | 31 | 设置持久化 | ✅ | `settings persist...`；`.dsh_RA/state.json`；显式清空/局部更新已单测 |
 | 32 | 输入区计划模式 | ✅ | 真实 `applySettings`：`/plan` → `plan.active=true`；卡片标签 |
@@ -49,7 +49,7 @@
 | 39 | 底部无平移提示 | ✅ | 只有缩放控件；无 hint |
 | 40 | 标题编辑 | ✅ | 详情双击/重命名；sidecar + 原生 rename |
 | 41 | 主题 | ✅ | light `01-default`；dark `shots-dark/01-default`；`--dsw-*` token |
-| 42 | 窄屏 | ✅ | `11-narrow`；780×860 无横向溢出 |
+| 42 | 窄屏 | ✅ | `11-narrow`；780×860 无横向溢出；缩放控件在输入区上方（UI 断言无重叠） |
 | 43 | `.dsh_RA` | ✅ | `ProjectStore` 单测；原子写/跨实例合并/损坏归档/`.gitignore` |
 | 44 | 安全边界 | ✅ | token/lastSeq/项目/过期；并发 confirm 只执行一次；target 不可读 fail-closed；auto ask 拒绝 |
 | 45 | 安装/构建 | ✅ | `npm run build`；真实 profile `dsh plugin add link:` |
@@ -60,6 +60,7 @@
 | 50 | 工具边界封闭性 | ✅ | 动态 `tools/change` 刷新、guard 拒绝非 `ra_*`、restrict 失败即失败；真实 DSH 只返回 4 工具 |
 | 51 | 脱敏 | ✅ | `redactSecrets`/`redactBrief` 单测；`buildSummaryInput` 脱敏断言 |
 | 52 | 派发幂等 | ✅ | `two concurrent confirms execute a route proposal once`；fork/new 失败保留 `resultSessionId` |
+| 53 | 项目切换 | ✅ | 项目下拉列出全部项目；`switching projects reads only that project...`；切换后画布/未跟踪只含该项目，并重新适配视图 |
 
 ## 真实环境额外验证
 
@@ -82,7 +83,7 @@
 ## 自动化验证
 
 ```text
-npm test        73 pass
-npm run test:ui UI acceptance passed（含打开会话导航与 Router preset 工具边界）
+npm test        74 pass
+npm run test:ui UI acceptance passed（含项目切换数据隔离、下拉字体一致、勾选恢复、窄屏缩放避让、打开会话导航与 Router preset 工具边界）
 npm run check   build + test
 ```

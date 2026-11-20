@@ -64,15 +64,15 @@ async function createHarness() {
   const permissionSets = [];
   let nextId = 1;
 
-  const addSession = (id, { title, turns = 2, age = 3600_000, parentSessionId = null, blank = false } = {}) => {
+  const addSession = (id, { title, turns = 2, age = 3600_000, parentSessionId = null, blank = false, cwd = project } = {}) => {
     const events = makeEvents(title, turns, Date.now() - age);
     records.set(id, {
-      session: { version: 4, id, cwd: project, createdAt: Date.now() - age, isSeeded: false, ...(parentSessionId ? { parentSession: parentSessionId } : {}) },
+      session: { version: 4, id, cwd, createdAt: Date.now() - age, isSeeded: false, ...(parentSessionId ? { parentSession: parentSessionId } : {}) },
       events,
     });
     summaries.set(id, {
       sessionId: id,
-      cwd: project,
+      cwd,
       // DSH's SessionSummary.updatedAt is the last *user prompt* time (or the
       // header creation time), not the log tail.
       updatedAt:
@@ -268,7 +268,7 @@ async function createHarness() {
     makeAgent,
     waitComplete,
     projectionFor,
-    cleanup: () => rm(project, { recursive: true, force: true }),
+    cleanup: () => rm(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }),
   };
 }
 
@@ -285,6 +285,34 @@ test('state indexes only the last 7 days, builds edges and untracked rows', asyn
     assert.ok(state.untracked.some((row) => row.sessionId === 'old' && row.reason === 'older'));
   } finally {
     await harness.cleanup();
+  }
+});
+
+test('switching projects reads only that project in the tree and untracked list', async () => {
+  const harness = await createHarness();
+  const other = await mkdtemp(join(tmpdir(), 'dsh-ra-other-'));
+  try {
+    harness.addSession('elsewhere', { title: '另一个项目', turns: 1, cwd: other });
+    const here = await harness.service.state({ project: harness.project });
+    assert.equal(here.selectedProject?.project, harness.project);
+    assert.deepEqual(here.tree.sessions.map((row) => row.sessionId).sort(), ['c', 'p']);
+    assert.ok(!here.untracked.some((row) => row.sessionId === 'elsewhere'));
+
+    // Selecting another project in the header must rebuild both the canvas and
+    // the untracked list from that project's sessions, with no leftovers.
+    const away = await harness.service.state({ project: other });
+    assert.equal(away.selectedProject?.project, other);
+    assert.deepEqual(away.tree.sessions.map((row) => row.sessionId), ['elsewhere']);
+    assert.equal(away.tree.sessions[0].title, '另一个项目');
+    assert.deepEqual(away.untracked, []);
+
+    const back = await harness.service.state({ project: harness.project });
+    assert.equal(back.selectedProject?.project, harness.project);
+    assert.ok(back.untracked.some((row) => row.sessionId === 'old'));
+    assert.ok(!back.tree.sessions.some((row) => row.sessionId === 'elsewhere'));
+  } finally {
+    await harness.cleanup();
+    await rm(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 

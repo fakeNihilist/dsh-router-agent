@@ -1,4 +1,16 @@
 import React from 'react';
+import { Select } from './Select.jsx';
+
+const MODE_OPTIONS = [
+  { value: 'standard', label: '标准' },
+  { value: 'plan', label: '计划模式' },
+];
+
+const PERMISSION_OPTIONS = [
+  { value: 'read-only', label: '只读' },
+  { value: 'workspace-write', label: '工作区内修改' },
+  { value: 'danger-full-access', label: '完全访问' },
+];
 
 export function Composer({
   task,
@@ -38,42 +50,35 @@ export function Composer({
         data-composer-input
       />
       <div className="dra-composer-bar">
-        <select
-          className="dra-select"
+        <Select
+          className="dra-mode-select"
           value={mode}
-          onChange={(event) => setMode(event.target.value)}
-          aria-label="模式"
+          onChange={setMode}
+          options={MODE_OPTIONS}
           disabled={disabled || !planAvailable}
-        >
-          <option value="standard">标准</option>
-          <option value="plan">计划模式</option>
-        </select>
-        <select
-          className="dra-select"
+          ariaLabel="模式"
+          menuMinWidth={150}
+        />
+        <Select
+          className="dra-permission-select"
           value={permissions}
-          onChange={(event) => setPermissions(event.target.value)}
-          aria-label="工作区权限"
+          onChange={setPermissions}
+          options={PERMISSION_OPTIONS}
           disabled={disabled || !permissionAvailable}
-        >
-          <option value="read-only">只读</option>
-          <option value="workspace-write">工作区内修改</option>
-          <option value="danger-full-access">完全访问</option>
-        </select>
+          ariaLabel="工作区权限"
+          menuMinWidth={180}
+        />
         <label className="dra-auto" data-on={auto ? 'true' : 'false'} title="开启后 RA 判断完直接执行，不再确认">
           <input
             type="checkbox"
             checked={auto}
             onChange={(event) => setAuto(event.target.checked)}
             disabled={disabled}
+            aria-label="自动执行"
           />
           <span className="dra-switch" />
-          自动执行
         </label>
         <span className="dra-spacer" />
-        <span className="dra-tag">
-          {mode === 'plan' ? '计划' : '标准'} ·{' '}
-          {permissions === 'read-only' ? '只读' : permissions === 'danger-full-access' ? '完全访问' : '工作区'}
-        </span>
         <button
           className="dra-btn dra-btn-primary"
           type="button"
@@ -83,13 +88,6 @@ export function Composer({
         >
           {busy ? '发送中…' : '发送'}
         </button>
-      </div>
-      <div className="dra-hint" data-warn={auto ? 'true' : 'false'}>
-        {disabled
-          ? disabledReason
-          : auto
-            ? '自动执行已开启：RA 判断后由 Host 校验并直接发送。'
-            : '默认需要确认；模式与权限按会话级生效，确认卡会显示目标变化。'}
       </div>
     </div>
   );

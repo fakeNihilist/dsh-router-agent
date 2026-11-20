@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { Select } from './Select.jsx';
 
 const ACTION_LABEL = {
   route: '继续已有会话',
@@ -53,18 +54,17 @@ export function ProposalCard({ proposal, target, busy, onConfirm, onChoose, onAb
       ) : null}
       {fork && target?.boundaries?.length ? (
         <div className="dra-detail-row">
-          <select
-            className="dra-select dra-grow"
+          <Select
+            className="dra-grow"
             value={String(proposal.atSeq ?? '')}
-            onChange={(event) => onChoose?.(proposal, Number(event.target.value))}
-            aria-label="分叉点"
-          >
-            {target.boundaries.map((item) => (
-              <option key={item.atSeq} value={String(item.atSeq)}>
-                T{item.turn} · {item.label}
-              </option>
-            ))}
-          </select>
+            onChange={(next) => onChoose?.(proposal, Number(next))}
+            options={target.boundaries.map((item) => ({
+              value: String(item.atSeq),
+              label: `T${item.turn} · ${item.label}`,
+            }))}
+            ariaLabel="分叉点"
+            menuMinWidth={260}
+          />
         </div>
       ) : null}
       {fork && target && target.boundaryCount > (target.boundaries?.length ?? 0) ? (
@@ -99,7 +99,7 @@ export function ProposalCard({ proposal, target, busy, onConfirm, onChoose, onAb
             ) : (
               <>
                 <input
-                  className="dra-select"
+                  className="dra-input"
                   value={answer}
                   placeholder="回答 RA…"
                   onChange={(event) => setAnswer(event.target.value)}

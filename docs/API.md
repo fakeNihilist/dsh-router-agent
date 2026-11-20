@@ -8,7 +8,7 @@
 
 ### `GET /api/router/state?project=<cwd>`
 
-返回面板的唯一读模型：
+返回面板的唯一读模型。`project` 决定画布和未跟踪列表读取哪个项目；省略时选择最近活跃的项目。
 
 ```json
 {
@@ -57,6 +57,7 @@
 }
 ```
 
+- 树和未跟踪列表始终只读取 `selectedProject` 的 cwd；`state()` 传入的全局摘要会先按项目过滤，不会跨项目泄漏。切换 `project` 会重建这两部分。
 - 根/兄弟顺序由客户端用 `lastActiveAt` 计算；`edges` 是 sidecar 解析后的父子关系。
 - `context.source` 为 `projection`（`contextPressure`）、`fold`（`assistant/message.usage` + `request/context.contextWindow`）或 `unknown`。
 - `lastActiveAt` 优先取日志末尾事件时间（不是最后一次用户提问时间）。

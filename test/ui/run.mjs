@@ -16,6 +16,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '../..');
 const HOME = process.env.DSH_RA_UI_HOME ?? 'D:/tmp/dsh-ra-ui-home';
 const PROJECT = 'D:/tmp/dsh-ra-ui-test';
+const OTHER = 'D:/tmp/dsh-ra-ui-other';
 const projectDirName = (project) => `--${project.replace(':', '').replaceAll('/', '-')}--`;
 const CLI = process.env.DSH_CLI ?? 'D:/deepseek harness/resources/runtime/cli/bin/dsh.cmd';
 const CLI_WIN = CLI.replaceAll('/', '\\');
@@ -93,6 +94,25 @@ async function ensureProfile() {
 
 async function seed() {
   await rm(join(HOME, 'sessions'), { recursive: true, force: true });
+  await rm(join(OTHER, '.dsh_RA'), { recursive: true, force: true });
+  // Build a one-session second project first, then the main corpus. The main
+  // corpus is therefore the most recent project and the default selection;
+  // switching to this one must rebuild the canvas and the untracked list.
+  const otherRoot = join(HOME, '.seed-other');
+  await rm(otherRoot, { recursive: true, force: true });
+  execFileSync(process.execPath, [join(REPO, 'tools', 'make-fixtures.mjs'), otherRoot], {
+    stdio: 'pipe',
+    env: { ...process.env, DSH_RA_PROJECT: OTHER },
+  });
+  const otherFixtures = JSON.parse(
+    await readFile(join(otherRoot, projectDirName(OTHER), 'fixtures.json'), 'utf8'),
+  );
+  const otherSession = otherFixtures.find((row) => row.title === '路由插件设计');
+  assert.ok(otherSession, 'second-project fixture missing');
+  const otherTarget = join(HOME, 'sessions', projectDirName(OTHER), otherSession.id);
+  await mkdir(dirname(otherTarget), { recursive: true });
+  await cp(join(otherRoot, projectDirName(OTHER), otherSession.id), otherTarget, { recursive: true });
+  await rm(otherRoot, { recursive: true, force: true });
   execFileSync(process.execPath, [join(REPO, 'tools', 'make-fixtures.mjs'), join(HOME, 'sessions')], {
     stdio: 'pipe',
     env: { ...process.env, DSH_RA_PROJECT: PROJECT },
@@ -104,6 +124,37 @@ async function seed() {
   await rm(join(PROJECT, '.dsh_RA'), { recursive: true, force: true });
   await mkdir(join(PROJECT, '.dsh_RA', 'proposals'), { recursive: true });
   const now = Date.now();
+  // Register the fixture directory as a real Workspace so the DSH sidebar and
+  // startup Session are deterministic. The Router panel itself lists every
+  // project and scopes the tree to the selected one.
+  await mkdir(join(HOME, 'storages'), { recursive: true });
+  await writeFile(
+    join(HOME, 'storages', 'workspace.json'),
+    `${JSON.stringify(
+      {
+        unit: { name: 'workspace', version: 2 },
+        global: {
+          initialized: true,
+          workspaceIds: ['ui-fixture-workspace'],
+          archivedSessionIds: [],
+          pinnedSessionIds: [],
+        },
+        tables: {
+          workspaces: {
+            'ui-fixture-workspace': {
+              path: PROJECT,
+              title: 'dsh-ra-test',
+              sessionIds: fixtures.map((row) => row.id),
+              createdAt: new Date(now - 30 * 24 * 3600_000).toISOString(),
+              updatedAt: new Date(now).toISOString(),
+            },
+          },
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
   const proposal = {
     token: 'ui-pending',
     project: PROJECT,
@@ -368,6 +419,18 @@ async function main() {
   const { child, fixtures } = await seed();
   const server = await startServer();
   await assertRouterBoundary(server);
+  // Prebuild the second project's brief so switching projects in the UI does
+  // not pause on the onboarding overlay.
+  let otherState = null;
+  for (let i = 0; i < 120; i += 1) {
+    otherState = await fetchJson(
+      `${server.base}/api/router/state?project=${encodeURIComponent(OTHER)}`,
+      server.cookie,
+    );
+    if (otherState.onboarding?.status === 'complete') break;
+    await sleep(250);
+  }
+  assert.equal(otherState?.onboarding?.status, 'complete', 'second project onboarding did not complete');
   const browser = await launchEdge(server.url);
   let failed = false;
   try {
@@ -412,23 +475,92 @@ async function main() {
       nodes: document.querySelectorAll('.dra-node').length,
       edges: document.querySelectorAll('.dra-edge').length,
       proposal: document.querySelector('.dra-proposal[data-proposal]')?.innerText ?? '',
-      project: document.querySelector('.dra-project select')?.value,
+      project: document.querySelector('.dra-project [aria-haspopup="listbox"]')?.dataset.value,
       countText: document.querySelector('.dra-project')?.innerText ?? '',
       composer: !!document.querySelector('.dra-composer'),
       search: !!document.querySelector('.dra-search input'),
       onboarding: document.body.innerText.includes('首次接入：建立会话索引'),
       pill: document.querySelector('.dra-project')?.innerText ?? '',
-      options: [...document.querySelectorAll('.dra-project option')].map((option) => option.textContent),
+      projectLabel: document.querySelector('.dra-project .dra-select-value')?.textContent ?? '',
     }))()`);
     console.log('summary', JSON.stringify(summary));
     assert.equal(summary.nodes, 13, 'expected 13 tracked nodes');
     assert.equal(summary.edges, 5, 'expected 5 parent→child edges');
     assert.equal(String(summary.project).split(String.fromCharCode(92)).join('/'), PROJECT);
-    assert.match(summary.countText, /· 16/);
+    assert.ok(summary.countText.includes('· 16'));
     assert.equal(summary.onboarding, false, 'onboarding overlay should be gone');
     assert.match(summary.proposal, /T2/);
     assert.match(summary.proposal, /确认发送/);
     await screenshot('01-default');
+
+    // The project menu is a themed listbox: same type scale as its trigger and
+    // rendered inside the panel, not by the OS (the native popup used a larger
+    // system font and a blue highlight).
+    await evaluate("document.querySelector('.dra-project .dra-select-trigger')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-select-pop')", 4000);
+    await sleep(220);
+    const projectMenu = await evaluate(`(() => {
+      const pop = document.querySelector('.dra-select-pop');
+      const options = [...pop.querySelectorAll('[role="option"]')];
+      const trigger = document.querySelector('.dra-project .dra-select-trigger');
+      return {
+        count: options.length,
+        selected: pop.querySelectorAll('[data-selected="true"]').length,
+        optionFont: options[0] ? getComputedStyle(options[0]).fontSize : null,
+        triggerFont: getComputedStyle(trigger).fontSize,
+        width: pop.getBoundingClientRect().width,
+        triggerWidth: trigger.getBoundingClientRect().width,
+        inPanel: Boolean(pop.closest('.dra')),
+      };
+    })()`);
+    console.log('project menu', JSON.stringify(projectMenu));
+    assert.equal(projectMenu.count, 2, 'the menu lists every project');
+    assert.equal(projectMenu.selected, 1, 'project menu marks the current project');
+    assert.equal(projectMenu.optionFont, projectMenu.triggerFont, 'project menu font must match the trigger');
+    assert.ok(projectMenu.width >= projectMenu.triggerWidth, 'project menu is at least as wide as its trigger');
+    assert.equal(projectMenu.inPanel, true, 'project menu stays inside the panel');
+    await screenshot('01-project-menu');
+
+    // Selecting another project rebuilds both the canvas and the untracked
+    // list, instead of only changing the header label.
+    await evaluate(`(() => {
+      const option = [...document.querySelectorAll('.dra-select-pop [role="option"]')]
+        .find((item) => item.textContent.includes('dsh-ra-ui-other'));
+      option?.click();
+    })()`);
+    await waitFor(evaluate, "document.querySelectorAll('.dra-node').length === 1", 8000);
+    assert.match(
+      await evaluate("document.querySelector('.dra-project .dra-select-value')?.textContent ?? ''"),
+      /dsh-ra-ui-other/,
+    );
+    assert.equal(
+      await evaluate("document.querySelector('.dra-node-title')?.textContent ?? ''"),
+      '路由插件设计',
+    );
+    await evaluate("document.querySelector('button[title=\\\"未跟踪会话\\\"]')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    assert.match(
+      await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''"),
+      /没有未跟踪的会话/,
+      'the untracked list belongs to the selected project',
+    );
+    await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
+    await sleep(200);
+
+    // Back to the fixture project: 13 nodes and its untracked sessions return.
+    await evaluate("document.querySelector('.dra-project .dra-select-trigger')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-select-pop')", 4000);
+    await evaluate(`(() => {
+      const option = [...document.querySelectorAll('.dra-select-pop [role="option"]')]
+        .find((item) => item.textContent.includes('dsh-ra-ui-test'));
+      option?.click();
+    })()`);
+    await waitFor(evaluate, "document.querySelectorAll('.dra-node').length >= 13", 8000);
+    assert.match(
+      await evaluate("document.querySelector('.dra-project .dra-select-value')?.textContent ?? ''"),
+      /dsh-ra-ui-test/,
+    );
+    await sleep(400);
 
     // Child is below its parent in the default vertical layout.
     const geometry = await evaluate(`(() => {
@@ -511,15 +643,34 @@ async function main() {
     await evaluate("document.querySelector('.dra-detail button[title=\"关闭详情\"]')?.click()");
     await sleep(250);
 
-    // Settings: switch to horizontal and verify the fork grows right.
+    // Settings: the layout menu is themed and escapes the dialog scroll box;
+    // switch to horizontal and verify the fork grows right.
     await evaluate("document.querySelector('button[title=\\\"Router 设置\\\"]')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
     await screenshot('03-settings');
-    await evaluate(`(() => {
-      const select = document.querySelector('#dra-layout');
-      select.value = 'horizontal';
-      select.dispatchEvent(new Event('change', { bubbles: true }));
+    await evaluate("document.querySelector('#dra-layout')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-select-pop')", 4000);
+    await sleep(220);
+    const layoutMenu = await evaluate(`(() => {
+      const trigger = document.querySelector('#dra-layout');
+      const options = [...document.querySelectorAll('.dra-select-pop [role="option"]')];
+      return {
+        count: options.length,
+        optionFont: options[0] ? getComputedStyle(options[0]).fontSize : null,
+        triggerFont: getComputedStyle(trigger).fontSize,
+        escapedDialog: !options[0]?.closest('.dra-modal'),
+      };
     })()`);
+    console.log('layout menu', JSON.stringify(layoutMenu));
+    assert.equal(layoutMenu.count, 2, 'layout menu should list both orientations');
+    assert.equal(layoutMenu.optionFont, layoutMenu.triggerFont, 'layout menu font must match the trigger');
+    assert.equal(layoutMenu.escapedDialog, true, 'dropdown must escape the dialog scroll container');
+    await screenshot('03-settings-menu');
+    await evaluate(`(() => {
+      const option = [...document.querySelectorAll('.dra-select-pop [role="option"]')].find((item) => item.dataset.value === 'horizontal');
+      option?.click();
+    })()`);
+    await waitFor(evaluate, "!document.querySelector('.dra-select-pop')", 3000);
     await evaluate(`(() => { const button = [...document.querySelectorAll('.dra-modal button')].find((item) => item.textContent.trim() === '保存'); button.click(); })()`);
     await waitFor(evaluate, "!document.querySelector('.dra-modal')", 5000);
     await sleep(3400);
@@ -532,13 +683,21 @@ async function main() {
     assert.ok(horizontal.child.left > horizontal.parent.right, 'horizontal fork must grow right');
     await screenshot('04-horizontal');
 
-    // Untracked modal lists the three older fixtures.
+    // Untracked modal lists the three older fixtures and asks for an explicit
+    // checkbox consent before anything can be restored.
     await evaluate("document.querySelector('button[title=\\\"未跟踪会话\\\"]')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
-    const untracked = await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''");
-    assert.match(untracked, /旧版：导出修复/);
-    assert.match(untracked, /旧版：CSV 转义/);
-    assert.match(untracked, /旧版：登录态过期/);
+    const untracked = await evaluate(`(() => ({
+      text: document.querySelector('.dra-modal')?.innerText ?? '',
+      checks: document.querySelectorAll('.dra-modal .dra-check').length,
+      restoreDisabled: [...document.querySelectorAll('.dra-modal-foot button')]
+        .find((item) => item.textContent.includes('恢复所选'))?.disabled,
+    }))()`);
+    assert.match(untracked.text, /旧版：导出修复/);
+    assert.match(untracked.text, /旧版：CSV 转义/);
+    assert.match(untracked.text, /旧版：登录态过期/);
+    assert.equal(untracked.checks, 3, 'each untracked session gets a checkbox');
+    assert.equal(untracked.restoreDisabled, true, 'restore stays disabled until a session is checked');
     await screenshot('05-untracked');
     await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
 
@@ -570,7 +729,24 @@ async function main() {
 
     await evaluate("document.querySelector('button[title=\\\"未跟踪会话\\\"]')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
-    await evaluate(`(() => { const row = [...document.querySelectorAll('.dra-modal .dra-list-row')].find((item) => item.innerText.includes('登录页表单校验')); row.querySelector('button').click(); })()`);
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll('.dra-modal .dra-check-row')].find((item) => item.innerText.includes('登录页表单校验'));
+      row?.querySelector('input[type="checkbox"]')?.click();
+    })()`);
+    await sleep(200);
+    const consent = await evaluate(`(() => {
+      const button = [...document.querySelectorAll('.dra-modal-foot button')].find((item) => item.textContent.includes('恢复所选'));
+      return {
+        disabled: button?.disabled,
+        counted: document.querySelector('.dra-modal-count')?.textContent ?? '',
+        checks: document.querySelectorAll('.dra-modal .dra-check').length,
+      };
+    })()`);
+    console.log('untracked consent', JSON.stringify(consent));
+    assert.equal(consent.checks, 4, 'the stopped parent joins the untracked list');
+    assert.equal(consent.disabled, false, 'checking a session enables restore');
+    assert.match(consent.counted, /1 \/ 4/);
+    await evaluate(`(() => { const button = [...document.querySelectorAll('.dra-modal-foot button')].find((item) => item.textContent.includes('恢复所选')); button?.click(); })()`);
     await waitFor(evaluate, "document.querySelectorAll('.dra-node').length === 13", 8000);
     assert.equal(await evaluate("document.querySelectorAll('.dra-edge').length"), 5);
     await sleep(3400);
@@ -595,7 +771,19 @@ async function main() {
       input.click();
     })()`);
     await sleep(250);
-    assert.match(await evaluate("document.querySelector('.dra-hint')?.innerText ?? ''"), /自动执行已开启/);
+    const autoSwitch = await evaluate(`(() => {
+      const label = document.querySelector('.dra-auto');
+      return {
+        on: label?.dataset.on,
+        checked: label?.querySelector('input')?.checked,
+        title: label?.title,
+        text: label?.innerText ?? '',
+      };
+    })()`);
+    assert.equal(autoSwitch.on, 'true');
+    assert.equal(autoSwitch.checked, true);
+    assert.match(autoSwitch.title, /直接执行/);
+    assert.equal(autoSwitch.text.trim(), '', 'the switch is icon-only; details live in the tooltip');
     await screenshot('09-auto');
     await evaluate(`(() => { const input=document.querySelector('.dra-auto input'); input.click(); })()`);
 
@@ -630,6 +818,19 @@ async function main() {
     assert.ok(narrow.width <= 780);
     assert.ok(narrow.overflow <= 1, 'panel must not overflow horizontally');
     assert.ok(narrow.composer.width > 0);
+    // In a narrow panel the composer spans the width; the zoom controls must
+    // sit above the measured composer stack instead of underneath it.
+    const zoomClear = await evaluate(`(() => {
+      const composer = document.querySelector('.dra-composer-wrap').getBoundingClientRect();
+      const zoom = document.querySelector('.dra-zoom').getBoundingClientRect();
+      return {
+        composer: composer.toJSON(),
+        zoom: zoom.toJSON(),
+        overlap: !(zoom.bottom <= composer.top || zoom.top >= composer.bottom || zoom.right <= composer.left || zoom.left >= composer.right),
+      };
+    })()`);
+    assert.equal(zoomClear.overlap, false, `composer must not cover the zoom controls: ${JSON.stringify(zoomClear)}`);
+    assert.ok(zoomClear.zoom.right <= 780, 'zoom controls stay inside the narrow viewport');
     await evaluate(`(() => { const node = document.querySelector('.dra-node'); node?.click(); })()`);
     await sleep(400);
     const narrowDetail = await evaluate(`(() => { const d=document.querySelector('.dra-detail'); if(!d) return null; const r=d.getBoundingClientRect(); return { left:r.left, right:r.right, top:r.top, width:r.width, viewport:innerWidth }; })()`);
