@@ -491,7 +491,26 @@ async function main() {
     assert.equal(summary.onboarding, false, 'onboarding overlay should be gone');
     assert.match(summary.proposal, /T2/);
     assert.match(summary.proposal, /确认发送/);
+    const composerBox = await evaluate(`(() => {
+      const input = document.querySelector('.dra-composer textarea');
+      const rect = input?.getBoundingClientRect();
+      return rect ? { height: rect.height, rows: input.rows } : null;
+    })()`);
+    assert.ok(composerBox?.height >= 84, `composer should be taller, got ${composerBox?.height}`);
+    assert.equal(composerBox.rows, 3);
+    const compressGlyph = await evaluate(`(() => {
+      const svg = document.querySelector('.dra-compress svg');
+      return svg ? { viewBox: svg.getAttribute('viewBox'), paths: svg.querySelectorAll('path').length } : null;
+    })()`);
+    assert.deepEqual(compressGlyph, { viewBox: '0 0 1024 1024', paths: 2 }, 'compress icon comes from the supplied SVG');
     await screenshot('01-default');
+
+    const caretBefore = await evaluate(`(() => {
+      const caret = document.querySelector('.dra-project .dra-caret');
+      const rect = caret?.getBoundingClientRect();
+      return rect ? { cx: rect.left + rect.width / 2, cy: rect.top + rect.height / 2, tag: caret.tagName.toLowerCase() } : null;
+    })()`);
+    assert.equal(caretBefore?.tag, 'svg', 'dropdown caret should be an SVG chevron');
 
     // The project menu is a themed listbox: same type scale as its trigger and
     // rendered inside the panel, not by the OS (the native popup used a larger
@@ -519,6 +538,15 @@ async function main() {
     assert.equal(projectMenu.optionFont, projectMenu.triggerFont, 'project menu font must match the trigger');
     assert.ok(projectMenu.width >= projectMenu.triggerWidth, 'project menu is at least as wide as its trigger');
     assert.equal(projectMenu.inPanel, true, 'project menu stays inside the panel');
+    const caretAfter = await evaluate(`(() => {
+      const caret = document.querySelector('.dra-project .dra-caret');
+      const rect = caret?.getBoundingClientRect();
+      return rect ? { cx: rect.left + rect.width / 2, cy: rect.top + rect.height / 2 } : null;
+    })()`);
+    assert.ok(
+      caretAfter && Math.abs(caretAfter.cx - caretBefore.cx) < 1 && Math.abs(caretAfter.cy - caretBefore.cy) < 1,
+      `caret must rotate around its center: ${JSON.stringify({ caretBefore, caretAfter })}`,
+    );
     await screenshot('01-project-menu');
 
     // Selecting another project rebuilds both the canvas and the untracked
@@ -581,7 +609,7 @@ async function main() {
     const detail = await evaluate("document.querySelector('.dra-detail')?.innerText ?? ''");
     assert.match(detail, /上下文/);
     assert.match(detail, /不再跟踪会话/);
-    assert.doesNotMatch(detail, /概览|血缘|一句话/);
+    assert.doesNotMatch(detail, /概览|血缘|一句话|分叉点/);
     await screenshot('02-detail');
 
     // "Open session" must navigate through uiWorkspace with a SessionId, not
@@ -647,6 +675,21 @@ async function main() {
     // switch to horizontal and verify the fork grows right.
     await evaluate("document.querySelector('button[title=\\\"Router 设置\\\"]')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    const settingsModels = await evaluate(`(() => {
+      const trigger = document.querySelector('#dra-ra-model');
+      return {
+        text: document.querySelector('.dra-modal')?.innerText ?? '',
+        raLabel: trigger?.querySelector('.dra-select-value')?.textContent ?? '',
+        raDisabled: Boolean(trigger?.disabled),
+      };
+    })()`);
+    assert.doesNotMatch(settingsModels.text, /跟随部署默认/);
+    if (!settingsModels.raDisabled) {
+      assert.ok(
+        settingsModels.raLabel && settingsModels.raLabel !== '选择模型',
+        `RA model should fall back to a catalog model, got "${settingsModels.raLabel}"`,
+      );
+    }
     await screenshot('03-settings');
     await evaluate("document.querySelector('#dra-layout')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-select-pop')", 4000);
@@ -687,18 +730,58 @@ async function main() {
     // checkbox consent before anything can be restored.
     await evaluate("document.querySelector('button[title=\\\"未跟踪会话\\\"]')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
-    const untracked = await evaluate(`(() => ({
-      text: document.querySelector('.dra-modal')?.innerText ?? '',
-      checks: document.querySelectorAll('.dra-modal .dra-check').length,
-      restoreDisabled: [...document.querySelectorAll('.dra-modal-foot button')]
-        .find((item) => item.textContent.includes('恢复所选'))?.disabled,
-    }))()`);
+    const untracked = await evaluate(`(() => {
+      const modal = document.querySelector('.dra-modal');
+      const body = modal?.querySelector('.dra-modal-body');
+      const foot = modal?.querySelector('.dra-modal-foot');
+      const restore = [...(foot?.querySelectorAll('button') ?? [])].find((item) => item.textContent.includes('恢复所选'));
+      return {
+        text: modal?.innerText ?? '',
+        checks: modal?.querySelectorAll('.dra-check').length,
+        restoreDisabled: restore?.disabled,
+        restoreLabel: restore?.textContent.trim() ?? '',
+        bodyOverflow: body ? getComputedStyle(body).overflowY : '',
+        modalOverflow: modal ? getComputedStyle(modal).overflow : '',
+        footOutside: Boolean(body && foot && !body.contains(foot)),
+      };
+    })()`);
     assert.match(untracked.text, /旧版：导出修复/);
     assert.match(untracked.text, /旧版：CSV 转义/);
     assert.match(untracked.text, /旧版：登录态过期/);
+    assert.doesNotMatch(untracked.text, /勾选同意恢复的会话/, 'the hint line is gone');
     assert.equal(untracked.checks, 3, 'each untracked session gets a checkbox');
     assert.equal(untracked.restoreDisabled, true, 'restore stays disabled until a session is checked');
+    assert.equal(untracked.restoreLabel, '恢复所选', 'restore label carries no count');
+    assert.equal(untracked.bodyOverflow, 'auto', 'only the dialog body scrolls');
+    assert.equal(untracked.modalOverflow, 'hidden', 'the dialog itself does not scroll');
+    assert.equal(untracked.footOutside, true, 'the action row sits outside the scrolling body');
     await screenshot('05-untracked');
+    // A long list must stay capped and scroll inside the body; the action row
+    // must remain pinned at the dialog bottom.
+    const capped = await evaluate(`(() => {
+      const modal = document.querySelector('.dra-modal-untracked');
+      const body = modal?.querySelector('.dra-modal-body');
+      const list = body?.querySelector('.dra-list');
+      const row = list?.firstElementChild;
+      if (!modal || !body || !row) return null;
+      for (let i = 0; i < 24; i += 1) list.appendChild(row.cloneNode(true));
+      const modalRect = modal.getBoundingClientRect();
+      const footRect = modal.querySelector('.dra-modal-foot')?.getBoundingClientRect();
+      return {
+        modalHeight: modalRect.height,
+        viewportHeight: innerHeight,
+        bodyScrolls: body.scrollHeight > body.clientHeight,
+        footerInside: Boolean(footRect) && Math.abs(footRect.bottom - modalRect.bottom) < 2,
+        maxHeight: getComputedStyle(modal).maxHeight,
+      };
+    })()`);
+    assert.ok(capped, 'untracked dialog missing');
+    assert.ok(capped.modalHeight <= 561, `dialog height must stay capped, got ${capped.modalHeight}`);
+    assert.ok(capped.modalHeight < capped.viewportHeight - 80, 'dialog keeps breathing room around the panel');
+    assert.equal(capped.bodyScrolls, true, 'long lists scroll inside the body');
+    assert.equal(capped.footerInside, true, 'footer stays at the dialog bottom');
+    assert.match(capped.maxHeight, /560px/);
+    await screenshot('05-untracked-long');
     await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
 
     // History modal has both tabs.
@@ -765,7 +848,7 @@ async function main() {
     await screenshot('08-compress');
     await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
 
-    // Auto toggle is explicit and changes the hint.
+    // Auto toggle keeps its label and uses the panel's custom tooltip.
     await evaluate(`(() => {
       const input = document.querySelector('.dra-auto input');
       input.click();
@@ -776,15 +859,35 @@ async function main() {
       return {
         on: label?.dataset.on,
         checked: label?.querySelector('input')?.checked,
-        title: label?.title,
+        title: label?.getAttribute('title'),
         text: label?.innerText ?? '',
       };
     })()`);
     assert.equal(autoSwitch.on, 'true');
     assert.equal(autoSwitch.checked, true);
-    assert.match(autoSwitch.title, /直接执行/);
-    assert.equal(autoSwitch.text.trim(), '', 'the switch is icon-only; details live in the tooltip');
+    assert.equal(autoSwitch.title, null, 'the native title tooltip is gone');
+    assert.equal(autoSwitch.text.trim(), '自动执行');
     await screenshot('09-auto');
+    const tipPoint = await evaluate(`(() => {
+      const rect = document.querySelector('.dra-auto')?.getBoundingClientRect();
+      return rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null;
+    })()`);
+    await browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: tipPoint.x, y: tipPoint.y });
+    await sleep(280);
+    const tip = await evaluate(`(() => {
+      const node = document.querySelector('.dra-tip');
+      return {
+        text: node?.textContent ?? '',
+        role: node?.getAttribute('role'),
+        background: node ? getComputedStyle(node).backgroundColor : null,
+      };
+    })()`);
+    assert.match(tip.text, /直接执行/);
+    assert.equal(tip.role, 'tooltip');
+    await screenshot('09-auto-tooltip');
+    await browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 5, y: 5 });
+    await sleep(150);
+    assert.equal(await evaluate("!!document.querySelector('.dra-tip')"), false, 'tooltip hides on leave');
     await evaluate(`(() => { const input=document.querySelector('.dra-auto input'); input.click(); })()`);
 
     // Zoom controls change the world transform.

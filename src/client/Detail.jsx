@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react';
 import { CloseIcon, CompressIcon, StopIcon } from './icons.jsx';
-import { Select } from './Select.jsx';
 
 function tokens(value) {
   if (value === null || value === undefined) return '—';
@@ -18,12 +17,10 @@ function level(percent) {
 
 export function Detail({
   session,
-  pendingFork,
   onOpen,
   onCompress,
   onStop,
   onRename,
-  onSelectAtSeq,
   onClose,
   canCompress = true,
 }) {
@@ -34,7 +31,6 @@ export function Detail({
     setEditing(false);
   }, [session.sessionId, session.title]);
   const percent = session.context?.percent;
-  const boundary = pendingFork?.atSeq ?? session.boundaries?.[0]?.atSeq ?? '';
   const commit = () => {
     const clean = title.trim();
     setEditing(false);
@@ -81,39 +77,6 @@ export function Detail({
             重命名
           </button>
         ) : null}
-      </div>
-
-      <div className="dra-detail-section">
-        <div className="dra-detail-label">分叉点</div>
-        {session.boundaries?.length ? (
-          <>
-            <div className="dra-detail-row">
-              <Select
-                className="dra-grow"
-                value={String(boundary)}
-                onChange={(next) => onSelectAtSeq?.(session.sessionId, Number(next))}
-                options={session.boundaries.map((item) => ({
-                  value: String(item.atSeq),
-                  label: `T${item.turn} · ${item.label}`,
-                }))}
-                disabled={!pendingFork}
-                title={pendingFork ? '更换 RA 提议的分叉点' : '等 RA 提出分叉后再选择'}
-                ariaLabel="分叉点"
-                menuMinWidth={240}
-              />
-            </div>
-            <div className="dra-field-help">
-              {session.boundaryCount > (session.boundaries?.length ?? 0)
-                ? `只显示最近 ${session.boundaries.length} 轮（共 ${session.boundaryCount} 轮）。`
-                : null}
-              {pendingFork
-                ? '这是 RA 提议的分叉点，可以在这里更换；确认后从该轮之后分叉。'
-                : '分叉点由 RA 在提议中给出；这里只展示可用边界。'}
-            </div>
-          </>
-        ) : (
-          <div className="dra-field-help">还没有已完成的轮次，不能分叉。</div>
-        )}
       </div>
 
       <div className="dra-detail-section">

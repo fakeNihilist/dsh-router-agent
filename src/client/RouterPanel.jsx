@@ -463,21 +463,10 @@ export function RouterPanel({ openSession }) {
         {selected ? (
           <Detail
             session={selected}
-            pendingFork={
-              pendingList.find(
-                (item) => item.action === 'fork' && item.targetSessionId === selected.sessionId,
-              ) ?? null
-            }
             onOpen={(id) => openSession?.(id)}
             onCompress={(session) => setModal({ type: 'compress', session })}
             onStop={(session) => setModal({ type: 'stop', session })}
             onRename={rename}
-            onSelectAtSeq={(sessionId, atSeq) => {
-              const proposal = pendingList.find(
-                (item) => item.action === 'fork' && item.targetSessionId === sessionId,
-              );
-              if (proposal) choose(proposal, atSeq);
-            }}
             onClose={() => setSelectedId(null)}
             canCompress={data?.probe?.compact !== false}
           />

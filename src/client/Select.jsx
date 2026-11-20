@@ -15,6 +15,20 @@ import { createPortal } from 'react-dom';
 
 let counter = 0;
 
+function Caret() {
+  return (
+    <svg className="dra-caret" width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M4 6.5 8 10.5 12 6.5"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function buildEntries(options, groups) {
   const list = [];
   for (const option of options ?? []) list.push({ kind: 'option', ...option });
@@ -203,7 +217,7 @@ export function Select({
         onKeyDown={onKeyDown}
       >
         <span className="dra-select-value">{label}</span>
-        <span className="dra-caret" aria-hidden="true" />
+        <Caret />
       </button>
       {panel
         ? createPortal(

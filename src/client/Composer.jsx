@@ -1,5 +1,6 @@
 import React from 'react';
 import { Select } from './Select.jsx';
+import { Tip } from './Tooltip.jsx';
 
 const MODE_OPTIONS = [
   { value: 'standard', label: '标准' },
@@ -45,7 +46,7 @@ export function Composer({
         }}
         placeholder={disabled ? disabledReason : '描述要做的任务，Router 会判断继续、分叉还是新建…'}
         disabled={disabled}
-        rows={2}
+        rows={3}
         aria-label="任务"
         data-composer-input
       />
@@ -68,16 +69,19 @@ export function Composer({
           ariaLabel="工作区权限"
           menuMinWidth={180}
         />
-        <label className="dra-auto" data-on={auto ? 'true' : 'false'} title="开启后 RA 判断完直接执行，不再确认">
-          <input
-            type="checkbox"
-            checked={auto}
-            onChange={(event) => setAuto(event.target.checked)}
-            disabled={disabled}
-            aria-label="自动执行"
-          />
-          <span className="dra-switch" />
-        </label>
+        <Tip label="开启后 RA 判断完直接执行，不再确认">
+          <label className="dra-auto" data-on={auto ? 'true' : 'false'}>
+            <input
+              type="checkbox"
+              checked={auto}
+              onChange={(event) => setAuto(event.target.checked)}
+              disabled={disabled}
+              aria-label="自动执行"
+            />
+            <span className="dra-switch" />
+            自动执行
+          </label>
+        </Tip>
         <span className="dra-spacer" />
         <button
           className="dra-btn dra-btn-primary"

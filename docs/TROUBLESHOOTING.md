@@ -39,9 +39,9 @@
 - 运行中：等 `turn/end` 后再点。
 - 部署没有 `/compact` command 与 `ctx.compaction.compactNow` 时，压缩不可用；UI 会显示错误而不是假成功。
 
-## 模型设置只有“跟随部署默认”
+## 模型设置不可用
 
-隔离 profile 没有可用模型凭据时，`modelCatalog` 为空。真实 desktop profile 登录/配置 API Key 后会出现模型组。
+隔离 profile 没有可用模型凭据时，`modelCatalog` 为空，两个模型下拉会禁用并提示“没有可用的模型目录”。真实 desktop profile 登录/配置 API Key 后会出现模型组；未保存过选择时下拉会预选部署默认模型。
 
 ## 关系不对
 

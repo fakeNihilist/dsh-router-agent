@@ -9,10 +9,10 @@ function tokens(value) {
   return String(value);
 }
 
-function Mask({ children, onClose, label }) {
+function Mask({ children, onClose, label, className = '' }) {
   return (
     <div className="dra-modal-mask" onMouseDown={(event) => event.target === event.currentTarget && onClose?.()}>
-      <div className="dra-modal" role="dialog" aria-modal="true" aria-label={label}>
+      <div className={`dra-modal ${className}`.trim()} role="dialog" aria-modal="true" aria-label={label}>
         {children}
       </div>
     </div>
@@ -33,17 +33,25 @@ function Head({ title, onClose }) {
 
 export function SettingsModal({ settings, models, onSave, onClose }) {
   const [layout, setLayout] = useState(settings?.layout ?? 'vertical');
-  const [ra, setRa] = useState(modelValue(settings?.raModel));
-  const [fresh, setFresh] = useState(modelValue(settings?.defaultSessionModel));
+  const savedRa = modelValue(settings?.raModel);
+  const savedFresh = modelValue(settings?.defaultSessionModel);
+  const fallbackModel = defaultModelValue(models);
+  const [ra, setRa] = useState(() => savedRa || fallbackModel);
+  const [fresh, setFresh] = useState(() => savedFresh || fallbackModel);
   const [busy, setBusy] = useState(false);
   const groups = models?.groups ?? [];
+  // The dropdown no longer offers a "deployment default" row. When the user
+  // leaves the preselected default untouched, saving null keeps following the
+  // deployment default instead of pinning today's catalog entry.
+  const modelForSave = (value, saved) =>
+    !saved && value === fallbackModel ? null : parseModel(value);
   const save = async () => {
     setBusy(true);
     try {
       await onSave({
         layout,
-        raModel: parseModel(ra),
-        defaultSessionModel: parseModel(fresh),
+        raModel: modelForSave(ra, savedRa),
+        defaultSessionModel: modelForSave(fresh, savedFresh),
       });
       onClose?.();
     } catch {
@@ -76,8 +84,9 @@ export function SettingsModal({ settings, models, onSave, onClose }) {
             id="dra-ra-model"
             value={ra}
             onChange={setRa}
-            options={[{ value: '', label: '跟随部署默认' }]}
             groups={modelGroups(groups)}
+            disabled={groups.length === 0}
+            placeholder="选择模型"
             ariaLabel="RA 模型"
             menuMinWidth={260}
           />
@@ -89,8 +98,9 @@ export function SettingsModal({ settings, models, onSave, onClose }) {
             id="dra-new-model"
             value={fresh}
             onChange={setFresh}
-            options={[{ value: '', label: '跟随部署默认' }]}
             groups={modelGroups(groups)}
+            disabled={groups.length === 0}
+            placeholder="选择模型"
             ariaLabel="新会话默认模型"
             menuMinWidth={260}
           />
@@ -209,12 +219,9 @@ export function UntrackedModal({ items, onRestore, onClose }) {
     }
   };
   return (
-    <Mask onClose={onClose} label="未跟踪会话">
+    <Mask onClose={onClose} label="未跟踪会话" className="dra-modal-untracked">
       <Head title="未跟踪会话" onClose={onClose} />
       <div className="dra-modal-body">
-        <div className="dra-field-help" style={{ marginBottom: 10 }}>
-          勾选同意恢复的会话；恢复后会重新进入 RA 的上下文。默认只跟踪最近一周的会话，手动停止跟踪的会话也会出现在这里。
-        </div>
         {list.length === 0 ? (
           <div className="dra-field-help">没有未跟踪的会话。</div>
         ) : (
@@ -265,7 +272,7 @@ export function UntrackedModal({ items, onRestore, onClose }) {
           disabled={!chosen.length || busy}
           onClick={restore}
         >
-          {busy ? '恢复中…' : chosen.length ? `恢复所选（${chosen.length}）` : '恢复所选'}
+          {busy ? '恢复中…' : '恢复所选'}
         </button>
       </div>
     </Mask>
@@ -421,6 +428,19 @@ function modelGroups(groups) {
       label: model.name ?? model.id,
     })),
   }));
+}
+
+/** Select value for the deployment's default model, used when no override is saved. */
+function defaultModelValue(models) {
+  const fallback = models?.default;
+  const groups = models?.groups ?? [];
+  if (!fallback?.provider || !fallback?.model) return '';
+  const exact = groups.find((group) => group.id === fallback.provider);
+  if (exact && (exact.models ?? []).some((model) => model.id === fallback.model)) {
+    return `${exact.id}|${fallback.model}`;
+  }
+  const group = groups.find((item) => (item.models ?? []).some((model) => model.id === fallback.model));
+  return group ? `${group.id}|${fallback.model}` : '';
 }
 
 function parseModel(value) {

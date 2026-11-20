@@ -14,7 +14,7 @@
 | 4 | RA 不读/写代码 | ✅ | 全局工具 deny + `ra_*` guard；无 fs/bash/web/subagent/workflow；PTC `run_code` 也被 native executor 排除 |
 | 5 | 继续提议 | ✅ | `route proposal confirms token and sends the task`；真实 RA 路由 |
 | 6 | 分叉提议 | ✅ | `fork proposal records atSeq...`；真实 RA T2 fork 确认 |
-| 7 | 分叉点可改 | ✅ | `a fork proposal can change its boundary...`；详情/卡片 select |
+| 7 | 分叉点可改 | ✅ | `a fork proposal can change its boundary...`；提议卡 select（详情不再提供分叉点） |
 | 8 | 新建干净会话 | ✅ | `new proposal creates a clean session...`；首条 prompt=task |
 | 9 | 新会话默认模型 | ✅ | `new proposal... applies the model`；fork 同样应用 |
 | 10 | 追问 | ✅ | `answering an ask proposal...`；回答信封携带原任务；UI 选项/回答输入 |
@@ -30,14 +30,14 @@
 | 20 | 分叉不移动父 | ✅ | layout 父节点位置只由子树跨度决定，不被子活跃推动 |
 | 21 | 首屏适配 | ✅ | `fitSelection` 4/3/1；1440/900/780 截图 |
 | 22 | 节点上下文 | ✅ | `% + 2px 条`；阈值 60/85；UI 截图 |
-| 23 | 节点压缩图标 | ✅ | 点击弹确认；Host `/compact`；真实会话 36.6k→24.3k |
+| 23 | 节点压缩图标 | ✅ | 点击弹确认；使用提供的压缩 SVG；Host `/compact`；真实会话 36.6k→24.3k |
 | 24 | 详情上下文 | ✅ | 精确 used/limit/%；`02-detail` 截图 |
 | 25 | 节点无一句话/概览/血缘/T9/分支数 | ✅ | NodeCard 只渲染 title/time/context |
 | 26 | 详情无概览/血缘 | ✅ | UI 测试断言 `doesNotMatch(/概览|血缘|一句话/)` |
 | 27 | 停止跟踪 | ✅ | `stop parent...`；确认弹层；未跟踪恢复 |
 | 28 | 父子停止语义 | ✅ | `stop parent makes child root; restore reattaches`；真实 UI 截图 |
-| 29 | 未跟踪列表 | ✅ | `05-untracked`；reason `stopped/older`；只含当前选中项目；勾选同意后批量恢复，未勾选时按钮禁用 |
-| 30 | 设置界面 | ✅ | 布局/RA/新会话模型三项；`settings persist...`；UI 选项存在，模型组依赖部署凭据 |
+| 29 | 未跟踪列表 | ✅ | `05-untracked`；reason `stopped/older`；只含当前选中项目；无顶部提示；列表独立滚动、底部固定；最大高度 `min(560px, 100% - 40px)`；勾选同意后批量恢复，按钮不带数量 |
+| 30 | 设置界面 | ✅ | 布局/RA/新会话模型三项；模型下拉不再有“跟随部署默认”，未设置时预选部署默认模型；`settings persist...`；模型组依赖部署凭据 |
 | 31 | 设置持久化 | ✅ | `settings persist...`；`.dsh_RA/state.json`；显式清空/局部更新已单测 |
 | 32 | 输入区计划模式 | ✅ | 真实 `applySettings`：`/plan` → `plan.active=true`；卡片标签 |
 | 33 | 工作区权限 | ✅ | 真实 `permissionPresets.set`：workspace-write→read-only→回退 |
@@ -61,6 +61,7 @@
 | 51 | 脱敏 | ✅ | `redactSecrets`/`redactBrief` 单测；`buildSummaryInput` 脱敏断言 |
 | 52 | 派发幂等 | ✅ | `two concurrent confirms execute a route proposal once`；fork/new 失败保留 `resultSessionId` |
 | 53 | 项目切换 | ✅ | 项目下拉列出全部项目；`switching projects reads only that project...`；切换后画布/未跟踪只含该项目，并重新适配视图 |
+| 54 | 控件观感 | ✅ | 面板内自定义 tooltip；下拉箭头为 SVG 且绕中心旋转；压缩图标来自提供的 SVG；UI 断言 SVG 视框与旋转中心 |
 
 ## 真实环境额外验证
 

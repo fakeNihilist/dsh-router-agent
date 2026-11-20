@@ -179,6 +179,8 @@ export const CSS = `
   cursor: pointer;
   transition: border-color .15s, box-shadow .15s, opacity .18s, transform .18s;
   user-select: none;
+  display: flex;
+  flex-direction: column;
 }
 .dra-node:hover {
   border-color: var(--dra-border-strong);
@@ -234,7 +236,8 @@ export const CSS = `
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 7px;
+  margin-top: auto;
+  padding-top: 7px;
   color: var(--dra-text-3);
   font-size: 12px;
   white-space: nowrap;
@@ -373,20 +376,17 @@ export const CSS = `
 }
 .dra-caret {
   position: absolute;
-  right: 10px;
+  right: 9px;
   top: 50%;
-  width: 0;
-  height: 0;
-  border-left: 3.5px solid transparent;
-  border-right: 3.5px solid transparent;
-  border-top: 4.5px solid var(--dra-text-3);
-  margin-top: 1px;
+  width: 10px;
+  height: 10px;
+  color: var(--dra-text-3);
   transform: translateY(-50%);
-  transition: transform .15s, margin-top .15s;
+  transition: transform .15s, color .15s;
   pointer-events: none;
 }
 .dra-select-trigger[aria-expanded="true"] .dra-caret {
-  margin-top: -2px;
+  color: var(--dra-text-2);
   transform: translateY(-50%) rotate(180deg);
 }
 .dra-select-pop {
@@ -443,6 +443,43 @@ export const CSS = `
 }
 .dra-select-option[data-disabled="true"] { opacity: .42; cursor: not-allowed; }
 .dra-select-check { flex: 0 0 auto; color: var(--dra-accent); font-size: 12px; }
+
+.dra-tip-anchor { display: inline-flex; min-width: 0; }
+.dra-tip {
+  position: absolute;
+  z-index: 46;
+  width: max-content;
+  max-width: min(280px, calc(100% - 16px));
+  padding: 6px 9px;
+  border: 1px solid var(--dra-border-strong);
+  border-radius: 7px;
+  background: var(--dra-layer);
+  box-shadow: 0 6px 18px rgba(0,0,0,.2);
+  color: var(--dra-text);
+  font-size: 11.5px;
+  line-height: 1.45;
+  text-align: center;
+  transform: translate(-50%, -100%);
+  pointer-events: none;
+  animation: dra-tip-in .12s ease-out;
+}
+.dra-tip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -4px;
+  width: 7px;
+  height: 7px;
+  margin-left: -3.5px;
+  background: var(--dra-layer);
+  border-right: 1px solid var(--dra-border-strong);
+  border-bottom: 1px solid var(--dra-border-strong);
+  transform: rotate(45deg);
+}
+@keyframes dra-tip-in {
+  from { opacity: 0; transform: translate(-50%, calc(-100% + 4px)); }
+  to { opacity: 1; transform: translate(-50%, -100%); }
+}
 
 .dra-input {
   height: 30px;
@@ -527,8 +564,8 @@ export const CSS = `
 .dra-composer textarea {
   display: block;
   width: 100%;
-  min-height: 54px;
-  max-height: 180px;
+  min-height: 88px;
+  max-height: 220px;
   padding: 12px 13px 8px;
   border: 0;
   outline: 0;
@@ -665,15 +702,22 @@ export const CSS = `
 .dra-modal {
   width: min(460px, 100%);
   max-height: calc(100% - 20px);
-  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   border: 1px solid var(--dra-border-strong);
   border-radius: 14px;
   background: var(--dra-layer);
   box-shadow: var(--dra-shadow);
 }
+.dra-modal-untracked {
+  /* Many older sessions must not grow the dialog to the full panel height. */
+  max-height: min(560px, calc(100% - 40px));
+}
 .dra-modal-head {
   display: flex;
   align-items: center;
+  flex: 0 0 auto;
   gap: 8px;
   padding: 13px 14px;
   border-bottom: 1px solid var(--dra-border);
@@ -681,8 +725,21 @@ export const CSS = `
   font-weight: 650;
 }
 .dra-modal-head .dra-spacer { flex: 1 1 auto; }
-.dra-modal-body { padding: 13px 14px; }
-.dra-modal-foot { display: flex; align-items: center; gap: 8px; padding: 11px 14px; border-top: 1px solid var(--dra-border); }
+.dra-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 13px 14px;
+}
+.dra-modal-foot {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 8px;
+  padding: 11px 14px;
+  border-top: 1px solid var(--dra-border);
+}
 .dra-modal-foot .dra-spacer { flex: 1 1 auto; }
 .dra-modal-count { color: var(--dra-text-3); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .dra-field { margin-bottom: 13px; }
