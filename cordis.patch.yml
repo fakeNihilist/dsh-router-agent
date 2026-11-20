@@ -1,0 +1,32 @@
+# dsh-router-agent mounts two loader rows:
+#  1. the Host plugin, which owns the Router service, the /api/router routes,
+#     and the project .dsh_RA sidecar;
+#  2. a real Agent preset whose child plugins are ONLY the four read-only
+#     Router tools. The preset's plugin list is the capability boundary: the
+#     Router Agent never receives fs/bash/web/subagent/workflow tools.
+- insert:
+    - id: dsh-router-agent
+      name: dsh-router-agent
+      config:
+        firstRunDays: 7
+        summaryConcurrency: 2
+        summaryDebounceMs: 1200
+        summaryTimeoutMs: 45000
+        maxHistory: 100
+        autoSummaryMaxInputTokens: 8000
+        proposalTtlMs: 600000
+    - id: preset-router
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: router
+        name: Router
+        description: Session routing agent. Reads the project index and proposes; never executes.
+        order: 5
+        plugins:
+          # Pin native execution for the Router scope. Without this row a
+          # deployment that selects the PTC executor globally would expose
+          # `run_code` (direct Node access) to the Router Agent as well.
+          - id: router-executor
+            name: '@deepseek-ai/dsh-tool-executor-native'
+          - id: router-tools
+            name: dsh-router-agent/router-tools

@@ -1,0 +1,56 @@
+{
+  "name": "dsh-router-agent",
+  "version": "0.1.1",
+  "description": "Project-level Router Agent for DeepSeek Harness: route a task to an existing session, fork at a turn boundary, or start a clean session.",
+  "type": "module",
+  "main": "src/host/index.js",
+  "exports": {
+    ".": "./src/host/index.js",
+    "./router-tools": "./src/router-tools.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/",
+    "lib/client.js",
+    "tools/",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "STATUS.md",
+    "docs/",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-modules"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.2-0 <0.3.0-0"
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "probe": "node tools/probe.mjs",
+    "test": "node --test \"test/unit/*.test.js\" \"test/host/*.test.js\"",
+    "test:ui": "node test/ui/run.mjs",
+    "check": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  },
+  "license": "MIT"
+}

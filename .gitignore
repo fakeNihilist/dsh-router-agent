@@ -1,0 +1,12 @@
+node_modules/
+lib/client.body.js
+*.log
+test/ui/shots-dark/
+.dsh_RA/
+
+# Local design/test artifacts. The prototype and screenshots contain
+# real-project session titles and the author's workspace names; the public
+# repository ships code and text docs only.
+prototype/
+docs/shots/
+test/ui/shots/

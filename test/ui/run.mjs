@@ -1,0 +1,694 @@
+/**
+ * Real-browser UI acceptance for the Router panel.
+ *
+ * Boots an isolated DSH Web profile, seeds synthetic V4 sessions, opens Edge
+ * headless over CDP, and drives the actual plugin panel. No real project session
+ * is read or written. Screenshots land in test/ui/shots.
+ */
+import assert from 'node:assert/strict';
+import { spawn, execFileSync } from 'node:child_process';
+import { cp, copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = resolve(HERE, '../..');
+const HOME = process.env.DSH_RA_UI_HOME ?? 'D:/tmp/dsh-ra-ui-home';
+const PROJECT = 'D:/tmp/dsh-ra-ui-test';
+const projectDirName = (project) => `--${project.replace(':', '').replaceAll('/', '-')}--`;
+const CLI = process.env.DSH_CLI ?? 'D:/deepseek harness/resources/runtime/cli/bin/dsh.cmd';
+const CLI_WIN = CLI.replaceAll('/', '\\');
+const EDGE = process.env.EDGE ?? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+const SHOTS = join(HERE, 'shots');
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function runCli(args) {
+  execFileSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', `""${CLI_WIN}" ${args.join(' ')}"`], {
+    env: { ...process.env, DSH_HOME: HOME },
+    stdio: 'pipe',
+    windowsHide: true,
+    windowsVerbatimArguments: true,
+  });
+}
+
+async function freePort() {
+  return new Promise((resolvePort, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      server.close(() => resolvePort(port));
+    });
+  });
+}
+
+async function ensureProfile() {
+  await mkdir(join(HOME, 'profiles', 'ui'), { recursive: true });
+  let initialized = true;
+  try {
+    await readFile(join(HOME, 'profiles', 'ui', 'package.json'));
+  } catch {
+    initialized = false;
+  }
+  if (!initialized) runCli(['--profile', 'ui', '--from-default-profile', 'web', '--dump-config']);
+  let installed = true;
+  try {
+    await readFile(join(HOME, 'profiles', 'ui', 'node_modules', 'dsh-router-agent', 'package.json'));
+  } catch {
+    installed = false;
+  }
+  if (!installed) runCli(['plugin', '--profile', 'ui', 'add', `link:${REPO}`]);
+  // The model catalog and account chrome need the same credentials the real
+  // profile uses. This copies only local credential/model metadata into the
+  // isolated test home; sessions are never copied from the real project.
+  // Set DSH_RA_UI_NO_CREDENTIALS=1 to keep the test fully credential-free.
+  if (process.env.DSH_RA_UI_NO_CREDENTIALS !== '1') try {
+    const userHome = process.env.USERPROFILE ?? process.env.HOME ?? '';
+    await copyFile(join(userHome, '.dsh', '.credentials.yaml'), join(HOME, '.credentials.yaml'));
+    await cp(join(userHome, '.dsh', 'llm-deepseek'), join(HOME, 'llm-deepseek'), { recursive: true, force: true });
+    try {
+      await copyFile(join(userHome, '.dsh', 'settings.yaml.imported'), join(HOME, 'settings.yaml'));
+    } catch {}
+    try {
+      await copyFile(join(userHome, '.dsh', 'settings.yaml'), join(HOME, 'settings.yaml'));
+    } catch {}
+    try {
+      // Deterministic light screenshots by default; DSH_RA_UI_THEME=dark keeps
+      // the source preference so the same suite can refresh the dark set.
+      if (process.env.DSH_RA_UI_THEME !== 'dark') {
+        const settingsPath = join(HOME, 'settings.yaml');
+        const text = await readFile(settingsPath, 'utf8');
+        await writeFile(settingsPath, text.replace(/preference:\s*dark/g, 'preference: light'));
+      }
+    } catch {}
+  } catch {
+    // A credential-free profile still exercises extractive briefs and all UI.
+  }
+  await writeFile(
+    join(HOME, 'profiles', 'ui', 'cordis.patch.yml'),
+    ['# UI test overrides: deterministic extractive briefs.', '- id: dsh-router-agent', '  config:', '    dev: true', '    summaryUseLlm: false', '    summaryDelayMs: 800', ''].join('\n'),
+  );
+}
+
+async function seed() {
+  await rm(join(HOME, 'sessions'), { recursive: true, force: true });
+  execFileSync(process.execPath, [join(REPO, 'tools', 'make-fixtures.mjs'), join(HOME, 'sessions')], {
+    stdio: 'pipe',
+    env: { ...process.env, DSH_RA_PROJECT: PROJECT },
+  });
+  const fixtures = JSON.parse(await readFile(join(HOME, 'sessions', projectDirName(PROJECT), 'fixtures.json'), 'utf8'));
+  const child = fixtures.find((row) => row.title === '登录页：验证码刷新');
+  assert.ok(child, 'fixture child missing');
+  const boundary = child.boundaries[1] ?? child.boundaries.at(-1);
+  await rm(join(PROJECT, '.dsh_RA'), { recursive: true, force: true });
+  await mkdir(join(PROJECT, '.dsh_RA', 'proposals'), { recursive: true });
+  const now = Date.now();
+  const proposal = {
+    token: 'ui-pending',
+    project: PROJECT,
+    action: 'fork',
+    task: '给验证码刷新补一个端到端用例。',
+    targetSessionId: child.id,
+    targetTitle: child.title,
+    targetLastSeq: child.lastSeq,
+    atSeq: boundary.atSeq,
+    turn: boundary.turn,
+    title: null,
+    question: null,
+    options: [],
+    reason: '「验证码刷新」已经包含 reset 接线；第 3 轮转向焦点顺序，所以从第 2 轮之后分叉，保留刷新上下文。',
+    composer: { mode: 'standard', permissions: 'workspace-write', auto: false },
+    auto: false,
+    status: 'pending',
+    createdAt: now,
+    expiresAt: now + 3600_000,
+    raSessionId: null,
+    summary: `从「${child.title}」T${boundary.turn} 分叉（atSeq ${boundary.atSeq}）`,
+  };
+  await writeFile(join(PROJECT, '.dsh_RA', 'proposals', 'ui-pending.json'), `${JSON.stringify(proposal, null, 2)}\n`);
+  const parent = fixtures.find((row) => row.title === '登录页表单校验');
+  const autoTarget = fixtures.find((row) => row.title === '用量统计口径');
+  const history = [
+    {
+      id: 'ui-history-1',
+      at: new Date(now - 3 * 3600_000).toISOString(),
+      task: '登录页表单校验总是误报，帮我定位。',
+      action: 'route',
+      targetSessionId: parent.id,
+      targetTitle: parent.title,
+      atSeq: null,
+      turn: null,
+      reason: '同一功能的延续，直接接回原会话。',
+      result: 'sent',
+      mode: 'confirm',
+      composer: { mode: 'standard', permissions: 'workspace-write', auto: false },
+      error: null,
+    },
+    {
+      id: 'ui-history-2',
+      at: new Date(now - 2 * 3600_000).toISOString(),
+      task: '给验证码刷新补一个端到端用例。',
+      action: 'fork',
+      targetSessionId: child.id,
+      targetTitle: child.title,
+      atSeq: boundary.atSeq,
+      turn: boundary.turn,
+      reason: '后续方向不同，从第 2 轮之后分叉。',
+      result: 'forked',
+      mode: 'confirm',
+      composer: { mode: 'standard', permissions: 'workspace-write', auto: false },
+      error: null,
+    },
+    {
+      id: 'ui-history-3',
+      at: new Date(now - 3600_000).toISOString(),
+      task: '统计口径里缓存命中算不算输入？',
+      action: 'route',
+      targetSessionId: autoTarget.id,
+      targetTitle: autoTarget.title,
+      atSeq: null,
+      turn: null,
+      reason: '已有会话正好讨论用量统计。',
+      result: 'auto',
+      mode: 'auto',
+      composer: { mode: 'standard', permissions: 'workspace-write', auto: true },
+      error: null,
+    },
+  ];
+  await writeFile(
+    join(PROJECT, '.dsh_RA', 'dispatch.jsonl'),
+    `${history.map((row) => JSON.stringify(row)).join('\n')}\n`,
+  );
+  return { fixtures, child, proposal };
+}
+
+async function startServer() {
+  const port = await freePort();
+  const logPath = join(HOME, 'ui-run.log');
+  await mkdir(HOME, { recursive: true });
+  const proc = spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', `""${CLI_WIN}" --profile ui --no-open --port ${port} > "${logPath}" 2>&1"`], {
+    env: { ...process.env, DSH_HOME: HOME },
+    windowsHide: true,
+    stdio: 'ignore',
+    windowsVerbatimArguments: true,
+  });
+  let url = null;
+  for (let i = 0; i < 100; i += 1) {
+    await sleep(300);
+    try {
+      const log = await readFile(logPath, 'utf8');
+      const match = /http:\/\/127\.0\.0\.1:\d+\/\?token=[A-Za-z0-9_-]+/.exec(log);
+      if (match) {
+        url = match[0];
+        break;
+      }
+    } catch {
+      // server still starting
+    }
+  }
+  if (!url) {
+    proc.kill();
+    throw new Error(`DSH Web did not start; see ${logPath}`);
+  }
+  const response = await fetch(url, { redirect: 'manual' });
+  const cookies = response.headers.getSetCookie?.() ?? [];
+  const cookie = cookies.map((value) => value.split(';')[0]).join('; ');
+  const base = new URL(url).origin;
+  let last = null;
+  for (let i = 0; i < 120; i += 1) {
+    await sleep(250);
+    try {
+      const state = await fetchJson(`${base}/api/router/state`, cookie);
+      last = state;
+      if (state.ok && state.onboarding?.status === 'complete') return { proc, port, base, url, cookie };
+    } catch (error) {
+      last = String(error?.message ?? error);
+    }
+  }
+  console.error('last state:', JSON.stringify(last)?.slice(0, 800));
+  killPort(port);
+  killTree(proc);
+  throw new Error('Router onboarding did not complete');
+}
+
+async function fetchJson(url, cookie) {
+  const response = await fetch(url, { headers: { accept: 'application/json', ...(cookie ? { cookie } : {}) } });
+  return response.json();
+}
+
+async function postJson(url, cookie, body) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json', ...(cookie ? { cookie } : {}) },
+    body: JSON.stringify(body),
+  });
+  return response.json();
+}
+
+/**
+ * Create a Router-preset session in the isolated Host, resolve its Agent, and
+ * verify the scoped tool surface. This is the only automated check that the
+ * preset's native executor + allow-list actually compose in a real DSH.
+ */
+async function assertRouterBoundary(server) {
+  const created = await postJson(`${server.base}/api/router/api`, server.cookie, {
+    op: 'createTestSession',
+    cwd: PROJECT,
+    agentPreset: 'router',
+  });
+  assert.ok(created.sessionId, 'Router test session was not created');
+  await postJson(`${server.base}/api/router/api`, server.cookie, {
+    op: 'applySettings',
+    sessionId: created.sessionId,
+    composer: { mode: 'standard', permissions: 'workspace-write' },
+  });
+  // Plan mode and permission presets are target-session settings; the Router
+  // preset itself does not mount plan-mode. Exercise them on a normal session.
+  const target = await postJson(`${server.base}/api/router/api`, server.cookie, {
+    op: 'createTestSession',
+    cwd: PROJECT,
+  });
+  assert.ok(target.sessionId, 'normal target session was not created');
+  const dispatch = await postJson(`${server.base}/api/router/api`, server.cookie, {
+    op: 'applySettings',
+    sessionId: target.sessionId,
+    composer: { mode: 'plan', permissions: 'read-only' },
+  });
+  assert.equal(dispatch.plan?.after, true, 'plan mode did not apply');
+  assert.equal(dispatch.permissions?.after, 'read-only', 'permission preset did not apply');
+  const debug = await postJson(`${server.base}/api/router/api`, server.cookie, {
+    op: 'debugAgent',
+    sessionId: created.sessionId,
+  });
+  const tools = [...(debug.tools ?? [])].sort();
+  assert.deepEqual(tools, ['ra_brief', 'ra_history', 'ra_propose', 'ra_tree']);
+  console.log('router boundary', JSON.stringify({ preset: debug.preset, tools, dispatch }));
+}
+
+async function launchEdge(url) {
+  const port = await freePort();
+  const profile = join(HOME, `edge-profile-${Date.now()}`);
+  const proc = spawn(EDGE, [
+    '--headless=new',
+    '--disable-gpu',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--hide-scrollbars',
+    '--window-size=1440,1000',
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profile}`,
+    url,
+  ], { stdio: 'ignore', windowsHide: true });
+  let target = null;
+  for (let i = 0; i < 100; i += 1) {
+    await sleep(300);
+    try {
+      const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+      target = list.find((item) => item.type === 'page' && item.url.startsWith('http://127.0.0.1:'));
+      if (target) break;
+    } catch {
+      // not up yet
+    }
+  }
+  if (!target) {
+    killPort(port);
+    killTree(proc);
+    throw new Error('Edge CDP target not found');
+  }
+  const ws = new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise((resolveOpen, rejectOpen) => {
+    ws.onopen = resolveOpen;
+    ws.onerror = rejectOpen;
+  });
+  let nextId = 0;
+  const pending = new Map();
+  const errors = [];
+  ws.onmessage = (event) => {
+    const message = JSON.parse(event.data);
+    if (message.id && pending.has(message.id)) {
+      const { resolve: resolveCall, reject: rejectCall } = pending.get(message.id);
+      pending.delete(message.id);
+      if (message.error) rejectCall(new Error(JSON.stringify(message.error)));
+      else resolveCall(message.result);
+      return;
+    }
+    if (message.method === 'Runtime.exceptionThrown') {
+      errors.push(`${message.params.exceptionDetails.text} ${message.params.exceptionDetails.exception?.description ?? ''}`);
+    }
+    if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') {
+      errors.push(message.params.args.map((arg) => arg.value || arg.description).join(' '));
+    }
+  };
+  const send = (method, params = {}) => new Promise((resolveCall, rejectCall) => {
+    const id = ++nextId;
+    pending.set(id, { resolve: resolveCall, reject: rejectCall });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+  const evaluate = async (expression) => {
+    const result = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+    if (result.exceptionDetails) {
+      throw new Error(`evaluate failed: ${expression} :: ${JSON.stringify(result.exceptionDetails)}`);
+    }
+    return result.result?.value;
+  };
+  const screenshot = async (name) => {
+    const result = await send('Page.captureScreenshot', { format: 'png' });
+    await writeFile(join(SHOTS, `${name}.png`), Buffer.from(result.data, 'base64'));
+  };
+  await send('Runtime.enable');
+  await send('Page.enable');
+  return { proc, ws, send, evaluate, screenshot, errors, debugPort: port };
+}
+
+async function main() {
+  await rm(SHOTS, { recursive: true, force: true });
+  await mkdir(SHOTS, { recursive: true });
+  await ensureProfile();
+  const { child, fixtures } = await seed();
+  const server = await startServer();
+  await assertRouterBoundary(server);
+  const browser = await launchEdge(server.url);
+  let failed = false;
+  try {
+    const { evaluate, screenshot, errors } = browser;
+    for (let i = 0; i < 80; i += 1) {
+      if (await evaluate("document.readyState === 'complete' && document.body?.innerText.includes('Router')")) break;
+      await sleep(300);
+    }
+    await sleep(1200);
+    await evaluate(`(() => {
+      const button = [...document.querySelectorAll('button')].find((item) => item.textContent.trim() === '继续');
+      if (button) button.click();
+    })()`);
+    await sleep(500);
+    // The empty-account profile may show a second first-run panel. Escape and
+    // any explicit close affordance dismiss it; the test then owns the screen.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const open = await evaluate("document.querySelectorAll('[role=\"dialog\"]').length");
+      if (!open) break;
+      await browser.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      await browser.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      await evaluate(`(() => {
+        for (const dialog of document.querySelectorAll('[role="dialog"]')) {
+          const close = [...dialog.querySelectorAll('button')].find((item) => /关闭|close|×/i.test(item.getAttribute('aria-label') || item.title || item.textContent));
+          if (close) close.click();
+        }
+      })()`);
+      await sleep(300);
+    }
+    const clicked = await evaluate(`(() => {
+      const all = [...document.querySelectorAll('button, [role="button"], [role="tab"], a')];
+      const hit = all.find((el) => (el.getAttribute('aria-label') || el.textContent || '').trim() === 'Router')
+        || all.find((el) => (el.getAttribute('title') || '') === 'Router');
+      if (hit) { hit.click(); return true; }
+      return false;
+    })()`);
+    assert.equal(clicked, true, 'Router sidebar entry not clickable');
+    await waitFor(evaluate, "document.querySelectorAll('.dra-node').length >= 13", 15000);
+    await waitFor(evaluate, "document.querySelector('.dra-project')?.innerText.includes('· 16')", 10000);
+
+    const summary = await evaluate(`(() => ({
+      nodes: document.querySelectorAll('.dra-node').length,
+      edges: document.querySelectorAll('.dra-edge').length,
+      proposal: document.querySelector('.dra-proposal[data-proposal]')?.innerText ?? '',
+      project: document.querySelector('.dra-project select')?.value,
+      countText: document.querySelector('.dra-project')?.innerText ?? '',
+      composer: !!document.querySelector('.dra-composer'),
+      search: !!document.querySelector('.dra-search input'),
+      onboarding: document.body.innerText.includes('首次接入：建立会话索引'),
+      pill: document.querySelector('.dra-project')?.innerText ?? '',
+      options: [...document.querySelectorAll('.dra-project option')].map((option) => option.textContent),
+    }))()`);
+    console.log('summary', JSON.stringify(summary));
+    assert.equal(summary.nodes, 13, 'expected 13 tracked nodes');
+    assert.equal(summary.edges, 5, 'expected 5 parent→child edges');
+    assert.equal(String(summary.project).split(String.fromCharCode(92)).join('/'), PROJECT);
+    assert.match(summary.countText, /· 16/);
+    assert.equal(summary.onboarding, false, 'onboarding overlay should be gone');
+    assert.match(summary.proposal, /T2/);
+    assert.match(summary.proposal, /确认发送/);
+    await screenshot('01-default');
+
+    // Child is below its parent in the default vertical layout.
+    const geometry = await evaluate(`(() => {
+      const find = (title) => [...document.querySelectorAll('.dra-node')].find((node) => node.querySelector('.dra-node-title')?.textContent === title);
+      const parent = find('登录页表单校验').getBoundingClientRect();
+      const child = find('登录页：验证码刷新').getBoundingClientRect();
+      return { parent: parent.toJSON(), child: child.toJSON() };
+    })()`);
+    assert.ok(geometry.child.top > geometry.parent.bottom, 'vertical fork must grow downward');
+    assert.ok(geometry.child.left < geometry.parent.right && geometry.child.right > geometry.parent.left, 'child stays under the parent column');
+
+    // Detail has no overview/lineage/one-liner.
+    await evaluate(`(() => {
+      const node = [...document.querySelectorAll('.dra-node')].find((item) => item.querySelector('.dra-node-title')?.textContent === '登录页表单校验');
+      node.click();
+    })()`);
+    await sleep(400);
+    const detail = await evaluate("document.querySelector('.dra-detail')?.innerText ?? ''");
+    assert.match(detail, /上下文/);
+    assert.match(detail, /不再跟踪会话/);
+    assert.doesNotMatch(detail, /概览|血缘|一句话/);
+    await screenshot('02-detail');
+
+    // "Open session" must navigate through uiWorkspace with a SessionId, not
+    // an object wrapper (which resolves to an unknown target and does nothing).
+    const opened = await evaluate(`(() => {
+      const button = [...document.querySelectorAll('.dra-detail button')].find((item) => item.textContent.includes('打开会话'));
+      if (!button) return false;
+      button.click();
+      return true;
+    })()`);
+    assert.equal(opened, true, 'detail open-session button missing');
+    await sleep(1200);
+    const navigation = await evaluate(`(() => {
+      const panel = document.querySelector('.dra');
+      return {
+        present: Boolean(panel),
+        visible: panel ? Boolean(panel.offsetParent) && panel.getBoundingClientRect().width > 0 : false,
+        text: document.body.innerText.slice(0, 160),
+      };
+    })()`);
+    console.log('navigation', JSON.stringify(navigation));
+    await waitFor(
+      evaluate,
+      "(() => { const panel = document.querySelector('.dra'); return !panel || !panel.offsetParent || panel.getBoundingClientRect().width === 0; })()",
+      10000,
+    );
+    await sleep(600);
+    const reopened = await evaluate(`(() => {
+      const all = [...document.querySelectorAll('button, [role="button"], [role="tab"], a')];
+      const hit = all.find((el) => (el.getAttribute('aria-label') || el.textContent || '').trim() === 'Router')
+        || all.find((el) => (el.getAttribute('title') || '') === 'Router');
+      if (hit) { hit.click(); return true; }
+      return false;
+    })()`);
+    assert.equal(reopened, true, 'Router sidebar entry missing after navigation');
+    await waitFor(evaluate, "document.querySelectorAll('.dra-node').length >= 13", 15000);
+    await sleep(500);
+
+    await evaluate("document.querySelector('.dra-detail button[title=\"关闭详情\"]')?.click()");
+    await sleep(300);
+
+    // Search dims non-matches and Enter selects a hit.
+    await evaluate(`(() => {
+      const input = document.querySelector('.dra-search input');
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, '验证码');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`);
+    await sleep(350);
+    const dimmed = await evaluate("document.querySelectorAll('.dra-node[data-dim=\\\"true\\\"]').length");
+    assert.ok(dimmed > 0, 'search should dim non-matching nodes');
+    await evaluate(`(() => {
+      const input = document.querySelector('.dra-search input');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    })()`);
+    await sleep(250);
+    assert.match(await evaluate("document.querySelector('.dra-detail-title')?.textContent ?? ''"), /验证码/);
+    await evaluate(`(() => { const input=document.querySelector('.dra-search input'); const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set; setter.call(input,''); input.dispatchEvent(new Event('input',{bubbles:true})); })()`);
+    await evaluate("document.querySelector('.dra-detail button[title=\"关闭详情\"]')?.click()");
+    await sleep(250);
+
+    // Settings: switch to horizontal and verify the fork grows right.
+    await evaluate("document.querySelector('button[title=\\\"Router 设置\\\"]')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    await screenshot('03-settings');
+    await evaluate(`(() => {
+      const select = document.querySelector('#dra-layout');
+      select.value = 'horizontal';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await evaluate(`(() => { const button = [...document.querySelectorAll('.dra-modal button')].find((item) => item.textContent.trim() === '保存'); button.click(); })()`);
+    await waitFor(evaluate, "!document.querySelector('.dra-modal')", 5000);
+    await sleep(3400);
+    const horizontal = await evaluate(`(() => {
+      const find = (title) => [...document.querySelectorAll('.dra-node')].find((node) => node.querySelector('.dra-node-title')?.textContent === title);
+      const parent = find('登录页表单校验').getBoundingClientRect();
+      const child = find('登录页：验证码刷新').getBoundingClientRect();
+      return { parent: parent.toJSON(), child: child.toJSON() };
+    })()`);
+    assert.ok(horizontal.child.left > horizontal.parent.right, 'horizontal fork must grow right');
+    await screenshot('04-horizontal');
+
+    // Untracked modal lists the three older fixtures.
+    await evaluate("document.querySelector('button[title=\\\"未跟踪会话\\\"]')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    const untracked = await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''");
+    assert.match(untracked, /旧版：导出修复/);
+    assert.match(untracked, /旧版：CSV 转义/);
+    assert.match(untracked, /旧版：登录态过期/);
+    await screenshot('05-untracked');
+    await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
+
+    // History modal has both tabs.
+    await evaluate("document.querySelector('button[title=\\\"与 RA 的对话历史\\\"]')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    const history = await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''");
+    assert.match(history, /派发记录/);
+    assert.match(history, /与 RA 的对话/);
+    await screenshot('06-history');
+    await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
+
+    // Stop parent: the child becomes a root; restore reattaches.
+    await evaluate(`(() => {
+      const node = [...document.querySelectorAll('.dra-node')].find((item) => item.querySelector('.dra-node-title')?.textContent === '登录页表单校验');
+      node.click();
+    })()`);
+    await sleep(300);
+    await evaluate(`(() => { const button = [...document.querySelectorAll('.dra-detail button')].find((item) => item.textContent.includes('不再跟踪会话')); button.click(); })()`);
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    await evaluate(`(() => { const button = [...document.querySelectorAll('.dra-modal button')].find((item) => item.textContent.trim() === '停止跟踪'); button.click(); })()`);
+    await waitFor(evaluate, "document.querySelectorAll('.dra-node').length === 12", 8000);
+    const childAfterStop = await evaluate(`(() => {
+      const node = [...document.querySelectorAll('.dra-node')].find((item) => item.querySelector('.dra-node-title')?.textContent === '登录页：验证码刷新');
+      return node?.getBoundingClientRect().toJSON();
+    })()`);
+    assert.ok(childAfterStop, 'child remains tracked after the parent stops');
+    await screenshot('07-stop-parent');
+
+    await evaluate("document.querySelector('button[title=\\\"未跟踪会话\\\"]')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    await evaluate(`(() => { const row = [...document.querySelectorAll('.dra-modal .dra-list-row')].find((item) => item.innerText.includes('登录页表单校验')); row.querySelector('button').click(); })()`);
+    await waitFor(evaluate, "document.querySelectorAll('.dra-node').length === 13", 8000);
+    assert.equal(await evaluate("document.querySelectorAll('.dra-edge').length"), 5);
+    await sleep(3400);
+
+    // Compress dialog shows exact usage and never claims success up front.
+    const compressed = await evaluate(`(() => {
+      const node = [...document.querySelectorAll('.dra-node')].find((item) => item.querySelector('.dra-node-title')?.textContent === '登录页表单校验');
+      node.querySelector('button[title="压缩上下文"]').click();
+      return true;
+    })()`);
+    assert.equal(compressed, true);
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    const compressText = await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''");
+    assert.match(compressText, /200k/);
+    assert.match(compressText, /确认压缩/);
+    await screenshot('08-compress');
+    await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
+
+    // Auto toggle is explicit and changes the hint.
+    await evaluate(`(() => {
+      const input = document.querySelector('.dra-auto input');
+      input.click();
+    })()`);
+    await sleep(250);
+    assert.match(await evaluate("document.querySelector('.dra-hint')?.innerText ?? ''"), /自动执行已开启/);
+    await screenshot('09-auto');
+    await evaluate(`(() => { const input=document.querySelector('.dra-auto input'); input.click(); })()`);
+
+    // Zoom controls change the world transform.
+    const beforeZoom = await evaluate("document.querySelector('.dra-world')?.style.transform ?? ''");
+    await evaluate("document.querySelector('button[title=\\\"放大\\\"]')?.click()");
+    await sleep(250);
+    const afterZoom = await evaluate("document.querySelector('.dra-world')?.style.transform ?? ''");
+    assert.notEqual(beforeZoom, afterZoom);
+
+    // Onboarding overlay is a real Host state, not a static mock. Clear the
+    // briefs and retry; the test profile slows each build so the overlay is
+    // observable.
+    await rm(join(PROJECT, '.dsh_RA', 'sessions'), { recursive: true, force: true });
+    await fetch(`${server.base}/api/router/api`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: server.cookie },
+      body: JSON.stringify({ op: 'onboarding', project: PROJECT }),
+    });
+    await waitFor(evaluate, "document.body.innerText.includes('首次接入：建立会话索引')", 8000);
+    await screenshot('10-onboarding');
+    await waitFor(evaluate, "!document.body.innerText.includes('首次接入：建立会话索引')", 15000);
+
+    // Narrow viewport: detail overlays the canvas and nothing overflows.
+    await browser.send('Emulation.setDeviceMetricsOverride', { width: 780, height: 860, deviceScaleFactor: 1, mobile: false });
+    await sleep(700);
+    const narrow = await evaluate(`(() => ({
+      width: document.querySelector('.dra')?.getBoundingClientRect().width,
+      overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      composer: document.querySelector('.dra-composer')?.getBoundingClientRect().toJSON(),
+    }))()`);
+    assert.ok(narrow.width <= 780);
+    assert.ok(narrow.overflow <= 1, 'panel must not overflow horizontally');
+    assert.ok(narrow.composer.width > 0);
+    await evaluate(`(() => { const node = document.querySelector('.dra-node'); node?.click(); })()`);
+    await sleep(400);
+    const narrowDetail = await evaluate(`(() => { const d=document.querySelector('.dra-detail'); if(!d) return null; const r=d.getBoundingClientRect(); return { left:r.left, right:r.right, top:r.top, width:r.width, viewport:innerWidth }; })()`);
+    assert.ok(narrowDetail, 'narrow detail should open');
+    assert.ok(narrowDetail.left >= 0 && narrowDetail.right <= narrowDetail.viewport, 'narrow detail must stay inside the viewport');
+    await screenshot('11-narrow');
+
+    assert.deepEqual(errors, [], `console errors: ${JSON.stringify(errors)}`);
+    console.log('UI acceptance passed');
+    console.log(`screenshots: ${SHOTS}`);
+  } catch (error) {
+    failed = true;
+    console.error(error);
+    process.exitCode = 1;
+  } finally {
+    try {
+      browser.ws.close();
+    } catch {}
+    killPort(browser.debugPort);
+    killPort(server.port);
+    killTree(browser.proc);
+    killTree(server.proc);
+    if (!failed) await sleep(200);
+  }
+}
+
+function killPort(port) {
+  try {
+    const out = execFileSync('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique`,
+    ], { encoding: 'utf8', windowsHide: true });
+    for (const pid of out.split(/\s+/).filter(Boolean)) {
+      try {
+        execFileSync('taskkill.exe', ['/PID', pid, '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      } catch {}
+    }
+  } catch {}
+}
+
+function killTree(proc) {
+  if (!proc?.pid) return;
+  try {
+    execFileSync('taskkill.exe', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+  } catch {
+    try {
+      proc.kill();
+    } catch {}
+  }
+}
+
+async function waitFor(evaluate, expression, timeout) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    if (await evaluate(expression)) return;
+    await sleep(200);
+  }
+  throw new Error(`timed out waiting for: ${expression}`);
+}
+
+await main();
