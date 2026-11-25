@@ -18,9 +18,15 @@
 
 ## 首次接入一直运行 / 中断
 
-- `state.json.onboarding.status` 为 `running` 时，重启 Host 会从已完成的 brief 继续。
-- 队列/写入失败会把状态置为 `failed`，面板显示失败条目和重试；`onboarding` op 也会重试（已完成的 brief 跳过）。
+- 首次打开不会自动索引，`onboarding.status` 先为 `awaiting`；点“开始索引”才进入 `running`。点“稍后”会变成 `skipped`，仍可路由。
+- `running` 时重启 Host 会从已完成的 brief 继续。
+- 队列/写入失败会把状态置为 `failed`，面板显示提示条和重试；`onboarding` op（`action: retry`）也会重试（已完成的 brief 跳过）。
 - 若 `summaryUseLlm` 打开但模型不可用，会走抽取式 fallback，不应阻塞。
+
+## RA 一直没有提议
+
+- 如果判断结束但没有待确认提议，面板显示“Router 未完成”，可重新判断、换 Router 模型或取消任务；也可以选中节点手动派发。
+- 自动执行开启时，追问策略默认仍是“保留追问”，不会强行替用户选择；可在设置中改为“使用建议项”或“交给 RA 判断”。
 
 ## RA 说没有会话 / 工具返回 lossless JSON 错误
 
@@ -41,7 +47,7 @@
 
 ## 模型设置不可用
 
-隔离 profile 没有可用模型凭据时，`modelCatalog` 为空，两个模型下拉会禁用并提示“没有可用的模型目录”。真实 desktop profile 登录/配置 API Key 后会出现模型组；未保存过选择时下拉会预选部署默认模型。
+隔离 profile 没有可用模型凭据时，`modelCatalog` 为空，三个模型下拉会禁用并提示“没有可用的模型目录”。真实 desktop profile 登录/配置 API Key 后会出现模型组；未保存过选择时下拉会预选部署默认模型。
 
 ## 关系不对
 

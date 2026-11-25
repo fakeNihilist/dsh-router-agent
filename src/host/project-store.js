@@ -19,9 +19,17 @@ const TERMINAL_PROPOSAL_STATUSES = new Set([
 const DEFAULT_SETTINGS = {
   layout: 'vertical',
   raModel: null,
+  indexModel: null,
   defaultSessionModel: null,
+  // How the Host treats an `ask` proposal while auto mode is on:
+  // keep = still ask the user, suggest = auto-answer with the first option,
+  // decide = forbid asking and force the RA to pick route/fork/new.
+  autoAsk: 'keep',
+  trackingDays: 7,
   composer: { mode: 'standard', permissions: 'workspace-write', auto: false },
 };
+
+const AUTO_ASK_VALUES = new Set(['keep', 'suggest', 'decide']);
 
 const DEFAULT_STATE = (project) => ({
   version: 1,
@@ -36,7 +44,7 @@ const DEFAULT_STATE = (project) => ({
   titles: {},
   settings: structuredClone(DEFAULT_SETTINGS),
   onboarding: {
-    status: 'idle',
+    status: 'awaiting',
     total: 0,
     done: 0,
     startedAt: null,
@@ -45,7 +53,6 @@ const DEFAULT_STATE = (project) => ({
     failed: [],
   },
   summary: {},
-  lastSeen: {},
 });
 
 /**
@@ -133,23 +140,37 @@ export class ProjectStore {
   normalize(stored) {
     const base = DEFAULT_STATE(this.project);
     if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return base;
+    const settings = {
+      ...base.settings,
+      ...(stored.settings ?? {}),
+      composer: { ...base.settings.composer, ...(stored.settings?.composer ?? {}) },
+    };
+    // Older sidecars kept the tracking window under `state.tracking.days`.
+    // Keep following it until the user saves the new setting.
+    if (!stored.settings || !Object.hasOwn(stored.settings, 'trackingDays')) {
+      settings.trackingDays = Number(stored.tracking?.days) || base.settings.trackingDays;
+    }
+    if (!AUTO_ASK_VALUES.has(settings.autoAsk)) settings.autoAsk = 'keep';
+    const onboarding = { ...base.onboarding, ...(stored.onboarding ?? {}) };
+    // `idle` was the old name for “first run not started yet”. It used to start
+    // indexing automatically; now the user has to confirm it explicitly.
+    if (onboarding.status === 'idle') onboarding.status = 'awaiting';
+    // `lastSeen` was written on every collect but never read. Drop it from
+    // upgraded sidecars instead of carrying dead state forward.
+    const rest = { ...stored };
+    delete rest.lastSeen;
     return {
       ...base,
-      ...stored,
+      ...rest,
       project: this.project,
       tracking: { ...base.tracking, ...(stored.tracking ?? {}) },
       stopped: { ...(stored.stopped ?? {}) },
       pinned: { ...(stored.pinned ?? {}) },
       lineage: { ...(stored.lineage ?? {}) },
       titles: { ...(stored.titles ?? {}) },
-      settings: {
-        ...base.settings,
-        ...(stored.settings ?? {}),
-        composer: { ...base.settings.composer, ...(stored.settings?.composer ?? {}) },
-      },
-      onboarding: { ...base.onboarding, ...(stored.onboarding ?? {}) },
+      settings,
+      onboarding,
       summary: { ...(stored.summary ?? {}) },
-      lastSeen: { ...(stored.lastSeen ?? {}) },
     };
   }
 
@@ -251,13 +272,6 @@ export class ProjectStore {
     });
   }
 
-  async touchSeen(rows) {
-    if (!rows?.length) return;
-    return this.update((state) => {
-      for (const row of rows) state.lastSeen[row.sessionId] = row.updatedAt;
-    });
-  }
-
   async onboarding(patch) {
     return this.update((state) => {
       state.onboarding = { ...state.onboarding, ...patch };
@@ -289,9 +303,6 @@ export class ProjectStore {
     return this.update((state) => {
       for (const id of Object.keys(state.summary)) {
         if (!keepIds.has(id)) delete state.summary[id];
-      }
-      for (const id of Object.keys(state.lastSeen)) {
-        if (!keepIds.has(id)) delete state.lastSeen[id];
       }
     });
   }

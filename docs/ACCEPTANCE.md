@@ -29,29 +29,29 @@
 | 19 | 最后活跃排序 | ✅ | layout 单测；根/兄弟按 `lastActiveAt` |
 | 20 | 分叉不移动父 | ✅ | layout 父节点位置只由子树跨度决定，不被子活跃推动 |
 | 21 | 首屏适配 | ✅ | `fitSelection` 4/3/1；1440/900/780 截图 |
-| 22 | 节点上下文 | ✅ | `% + 2px 条`；阈值 60/85；UI 截图 |
-| 23 | 节点压缩图标 | ✅ | 点击弹确认；使用提供的压缩 SVG；Host `/compact`；真实会话 36.6k→24.3k |
+| 22 | 节点上下文 | ✅ | 环形进度 + 百分比；阈值 60/85；`01-default` / `15-manual` 截图 |
+| 23 | 详情压缩 | ✅ | 压缩只在详情；点击弹确认；使用提供的压缩 SVG；Host `/compact`；真实会话 36.6k→24.3k |
 | 24 | 详情上下文 | ✅ | 精确 used/limit/%；`02-detail` 截图 |
 | 25 | 节点无一句话/概览/血缘/T9/分支数 | ✅ | NodeCard 只渲染 title/time/context |
 | 26 | 详情无概览/血缘 | ✅ | UI 测试断言 `doesNotMatch(/概览|血缘|一句话/)` |
 | 27 | 停止跟踪 | ✅ | `stop parent...`；确认弹层；未跟踪恢复 |
 | 28 | 父子停止语义 | ✅ | `stop parent makes child root; restore reattaches`；真实 UI 截图 |
 | 29 | 未跟踪列表 | ✅ | `05-untracked`；reason `stopped/older`；只含当前选中项目；无顶部提示；列表独立滚动、底部固定；最大高度 `min(560px, 100% - 40px)`；勾选同意后批量恢复，按钮不带数量 |
-| 30 | 设置界面 | ✅ | 布局/RA/新会话模型三项；模型下拉不再有“跟随部署默认”，未设置时预选部署默认模型；`settings persist...`；模型组依赖部署凭据 |
+| 30 | 设置界面 | ✅ | 布局 / Router 模型（对话）/ 索引模型 / 新会话默认模型 / 自动执行追问策略 / 跟踪范围；三个模型下拉不再有“跟随部署默认”，未设置时预选部署默认模型；`settings persist auto-ask, index model...` |
 | 31 | 设置持久化 | ✅ | `settings persist...`；`.dsh_RA/state.json`；显式清空/局部更新已单测 |
-| 32 | 输入区计划模式 | ✅ | 真实 `applySettings`：`/plan` → `plan.active=true`；卡片标签 |
-| 33 | 工作区权限 | ✅ | 真实 `permissionPresets.set`：workspace-write→read-only→回退 |
-| 34 | 自动执行开关 | ✅ | 默认 false；UI 开关/警告；真实 auto |
-| 35 | 提议配置行 | ✅ | 标准/计划、工作区权限、自动标签、目标 before→after |
-| 36 | 对话历史 | ✅ | `06-history`；任务/动作/目标/理由/结果 |
+| 32 | 输入区计划模式 | ✅ | 合并进“操作权限”下拉；真实 `applySettings`：`/plan` → `plan.active=true` |
+| 33 | 工作区权限 | ✅ | 合并进“操作权限”下拉，去掉只读；真实 `permissionPresets.set` 仍支持 read-only 的 Host 路径 |
+| 34 | 自动执行开关 | ✅ | 默认 false；UI 开关；手动派发时禁用；真实 auto |
+| 35 | 提议配置行 | ✅ | 只在会改变目标时显示 before→after；目标未知显示“未知”；fork/new 显示将使用的设置 |
+| 36 | 派发记录 | ✅ | `06-history`；任务/动作/目标/理由/结果；“打开 RA 会话”入口；无重复对话 tab/刷新 |
 | 37 | 顶部精简 | ✅ | 无排序/跟踪数/右侧最近活跃；搜索占位“搜索会话” |
 | 38 | 搜索 | ✅ | UI 测试：输入变淡、Enter 选中；placeholder 正确 |
 | 39 | 底部无平移提示 | ✅ | 只有缩放控件；无 hint |
 | 40 | 标题编辑 | ✅ | 详情双击/重命名；sidecar + 原生 rename |
 | 41 | 主题 | ✅ | light `01-default`；dark `shots-dark/01-default`；`--dsw-*` token |
 | 42 | 窄屏 | ✅ | `11-narrow`；780×860 无横向溢出；缩放控件在输入区上方（UI 断言无重叠） |
-| 43 | `.dsh_RA` | ✅ | `ProjectStore` 单测；原子写/跨实例合并/损坏归档/`.gitignore` |
-| 44 | 安全边界 | ✅ | token/lastSeq/项目/过期；并发 confirm 只执行一次；target 不可读 fail-closed；auto ask 拒绝 |
+| 43 | `.dsh_RA` | ✅ | `ProjectStore` 单测；原子写/跨实例合并/损坏归档/`.gitignore`；`lastSeen` 已移除 |
+| 44 | 安全边界 | ✅ | token/lastSeq/项目/过期；并发 confirm 只执行一次；target 不可读 fail-closed；自动执行下 `autoAsk=decide` 才拒绝 ask |
 | 45 | 安装/构建 | ✅ | `npm run build`；真实 profile `dsh plugin add link:` |
 | 46 | 能力探测 | ✅ | `probeHost` 每次 state 刷新；`connection` 通过 `ctx.inject` 等待；UI disabled 由 probe 驱动 |
 | 47 | 打开会话导航 | ✅ | UI 测试点击详情“打开会话”，断言 Router 面板退出并重新进入 |
@@ -60,8 +60,16 @@
 | 50 | 工具边界封闭性 | ✅ | 动态 `tools/change` 刷新、guard 拒绝非 `ra_*`、restrict 失败即失败；真实 DSH 只返回 4 工具 |
 | 51 | 脱敏 | ✅ | `redactSecrets`/`redactBrief` 单测；`buildSummaryInput` 脱敏断言 |
 | 52 | 派发幂等 | ✅ | `two concurrent confirms execute a route proposal once`；fork/new 失败保留 `resultSessionId` |
-| 53 | 项目切换 | ✅ | 项目下拉列出全部项目；`switching projects reads only that project...`；切换后画布/未跟踪只含该项目，并重新适配视图 |
-| 54 | 控件观感 | ✅ | 面板内自定义 tooltip；下拉箭头为 SVG 且绕中心旋转；压缩图标来自提供的 SVG；UI 断言 SVG 视框与旋转中心 |
+| 53 | 项目切换 | ✅ | 项目下拉列出全部项目并显示“会话 · 跟踪”；`switching projects reads only that project...` |
+| 54 | 控件观感 | ✅ | 面板内自定义 tooltip；下拉箭头为 SVG 且绕中心旋转；详情压缩图标来自提供的 SVG；UI 断言 SVG 视框与旋转中心 |
+| 55 | 手动派发 | ✅ | `manual dispatch creates a normal pending proposal...`；UI `15-manual`：会话名 + 指定/分叉/新会话；强制 `auto:false` |
+| 56 | 提议纠正 | ✅ | `retry abandons...` / `manual retarget moves the target`；任务原文显示；取消/过期/409 回填输入框 |
+| 57 | RA 失败兜底 | ✅ | 无提议时显示“Router 未完成”；`cancel task clears...`；60 秒提示 |
+| 58 | 索引确认 | ✅ | 默认 `awaiting` 不建索引；`first index waits for confirmation...`；跳过仍可 ask；`onboarding reset/start` UI 截图 |
+| 59 | 跟踪范围 | ✅ | `settings persist auto-ask, index model...`；项目下拉 tracked 计数断言 |
+| 60 | 自动追问三策略 | ✅ | `auto mode keeps asking...` / `can forbid asking...` / `can answer an ask with its first suggestion` |
+| 61 | 双模型拆分 | ✅ | 索引模型用于 `BriefPipeline.model()`；Router 模型只作用于 RA 会话；设置文案“新建和分叉” |
+| 62 | 索引续跑 | ✅ | `onboarding resumes and skips briefs already built`；running 状态在新 Host 自动续跑 |
 
 ## 真实环境额外验证
 
@@ -84,7 +92,7 @@
 ## 自动化验证
 
 ```text
-npm test        74 pass
-npm run test:ui UI acceptance passed（含项目切换数据隔离、下拉字体一致、勾选恢复、窄屏缩放避让、打开会话导航与 Router preset 工具边界）
+npm test        83 pass
+npm run test:ui UI acceptance passed（含手动派发条、环形进度、索引确认卡、历史入口、设置新字段、项目切换、下拉字体、勾选恢复、窄屏避让、打开会话与 Router preset 工具边界）
 npm run check   build + test
 ```

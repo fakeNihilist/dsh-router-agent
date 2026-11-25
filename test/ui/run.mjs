@@ -93,6 +93,9 @@ async function ensureProfile() {
 }
 
 async function seed() {
+  // A failed acceptance run can leave its DSH Web child alive; it would race
+  // this seed's sidecar cleanup with the next run's server.
+  killStrayUiServers();
   await rm(join(HOME, 'sessions'), { recursive: true, force: true });
   await rm(join(OTHER, '.dsh_RA'), { recursive: true, force: true });
   // Build a one-session second project first, then the main corpus. The main
@@ -266,12 +269,19 @@ async function startServer() {
   const cookies = response.headers.getSetCookie?.() ?? [];
   const cookie = cookies.map((value) => value.split(';')[0]).join('; ');
   const base = new URL(url).origin;
+  // First indexing is user-confirmed now; the acceptance profile opts in once
+  // the project appears in the Host's session list.
+  let started = false;
   let last = null;
   for (let i = 0; i < 120; i += 1) {
     await sleep(250);
     try {
       const state = await fetchJson(`${base}/api/router/state`, cookie);
       last = state;
+      if (state.ok && state.onboarding?.status === 'awaiting' && !started) {
+        await postJson(`${base}/api/router/api`, cookie, { op: 'onboarding', project: PROJECT, action: 'start' });
+        started = true;
+      }
       if (state.ok && state.onboarding?.status === 'complete') return { proc, port, base, url, cookie };
     } catch (error) {
       last = String(error?.message ?? error);
@@ -420,7 +430,29 @@ async function main() {
   const server = await startServer();
   await assertRouterBoundary(server);
   // Prebuild the second project's brief so switching projects in the UI does
-  // not pause on the onboarding overlay.
+  // not pause on the onboarding overlay. The session list scan can lag the
+  // server becoming ready, so wait until the project is actually listed
+  // before the first user-confirmed index starts.
+  const norm = (value) => String(value ?? '').replaceAll('\\', '/').toLowerCase();
+  let otherListed = null;
+  for (let i = 0; i < 80; i += 1) {
+    otherListed = await fetchJson(
+      `${server.base}/api/router/state?project=${encodeURIComponent(OTHER)}`,
+      server.cookie,
+    );
+    if (norm(otherListed?.selectedProject?.project) === norm(OTHER)) break;
+    await sleep(250);
+  }
+  assert.equal(
+    norm(otherListed?.selectedProject?.project),
+    norm(OTHER),
+    `second project was not listed: ${JSON.stringify(otherListed)?.slice(0, 500)}`,
+  );
+  await postJson(`${server.base}/api/router/api`, server.cookie, {
+    op: 'onboarding',
+    project: OTHER,
+    action: 'start',
+  });
   let otherState = null;
   for (let i = 0; i < 120; i += 1) {
     otherState = await fetchJson(
@@ -469,7 +501,7 @@ async function main() {
     })()`);
     assert.equal(clicked, true, 'Router sidebar entry not clickable');
     await waitFor(evaluate, "document.querySelectorAll('.dra-node').length >= 13", 15000);
-    await waitFor(evaluate, "document.querySelector('.dra-project')?.innerText.includes('· 16')", 10000);
+    await waitFor(evaluate, "document.querySelector('.dra-project')?.innerText.includes('16 会话')", 10000);
 
     const summary = await evaluate(`(() => ({
       nodes: document.querySelectorAll('.dra-node').length,
@@ -487,10 +519,12 @@ async function main() {
     assert.equal(summary.nodes, 13, 'expected 13 tracked nodes');
     assert.equal(summary.edges, 5, 'expected 5 parent→child edges');
     assert.equal(String(summary.project).split(String.fromCharCode(92)).join('/'), PROJECT);
-    assert.ok(summary.countText.includes('· 16'));
+    assert.ok(summary.countText.includes('16 会话'));
+    assert.ok(summary.countText.includes('13 跟踪'), 'project label reports the tracked subset');
     assert.equal(summary.onboarding, false, 'onboarding overlay should be gone');
     assert.match(summary.proposal, /T2/);
     assert.match(summary.proposal, /确认发送/);
+    assert.match(summary.proposal, /给验证码刷新补一个端到端用例/, 'proposal card shows the original task');
     const composerBox = await evaluate(`(() => {
       const input = document.querySelector('.dra-composer textarea');
       const rect = input?.getBoundingClientRect();
@@ -498,12 +532,43 @@ async function main() {
     })()`);
     assert.ok(composerBox?.height >= 84, `composer should be taller, got ${composerBox?.height}`);
     assert.equal(composerBox.rows, 3);
-    const compressGlyph = await evaluate(`(() => {
-      const svg = document.querySelector('.dra-compress svg');
-      return svg ? { viewBox: svg.getAttribute('viewBox'), paths: svg.querySelectorAll('path').length } : null;
+    const nodeGauge = await evaluate(`(() => {
+      const ring = document.querySelector('.dra-node .dra-ring');
+      const svg = ring?.querySelector('svg');
+      return {
+        ring: !!ring,
+        percent: ring?.closest('.dra-ctx')?.querySelector('.dra-ctx-text')?.textContent ?? '',
+        fills: svg?.querySelectorAll('.dra-ring-fill').length ?? 0,
+        nodeCompress: !!document.querySelector('.dra-node .dra-compress'),
+      };
     })()`);
-    assert.deepEqual(compressGlyph, { viewBox: '0 0 1024 1024', paths: 2 }, 'compress icon comes from the supplied SVG');
+    assert.ok(nodeGauge.ring, 'node context is a ring gauge');
+    assert.match(nodeGauge.percent, /%|—/);
+    assert.equal(nodeGauge.nodeCompress, false, 'compression lives in the detail panel only');
     await screenshot('01-default');
+
+    // Selecting a node turns the composer into a manual dispatch control with
+    // the session name and exactly three actions. Auto mode is disabled here.
+    await evaluate(`(() => {
+      const node = [...document.querySelectorAll('.dra-node')].find((item) => item.querySelector('.dra-node-title')?.textContent === '登录页表单校验');
+      node?.click();
+    })()`);
+    await waitFor(evaluate, "!!document.querySelector('.dra-manual')", 4000);
+    const manual = await evaluate(`(() => ({
+      title: document.querySelector('.dra-manual-title')?.textContent ?? '',
+      options: [...document.querySelectorAll('.dra-seg-btn')].map((item) => item.textContent.trim()),
+      forkDisabled: [...document.querySelectorAll('.dra-seg-btn')].find((item) => item.textContent.trim() === '分叉')?.disabled ?? null,
+      autoDisabled: document.querySelector('.dra-auto input')?.disabled ?? null,
+      autoManual: document.querySelector('.dra-auto')?.dataset.manual ?? null,
+    }))()`);
+    assert.match(manual.title, /登录页表单校验/);
+    assert.deepEqual(manual.options, ['指定', '分叉', '新会话']);
+    assert.equal(manual.forkDisabled, false, 'the seeded session has fork boundaries');
+    assert.equal(manual.autoDisabled, true, 'manual dispatch never auto-executes');
+    assert.equal(manual.autoManual, 'true');
+    await screenshot('15-manual');
+    await evaluate("document.querySelector('.dra-manual-clear')?.click()");
+    await waitFor(evaluate, "!document.querySelector('.dra-manual')", 3000);
 
     const caretBefore = await evaluate(`(() => {
       const caret = document.querySelector('.dra-project .dra-caret');
@@ -681,9 +746,16 @@ async function main() {
         text: document.querySelector('.dra-modal')?.innerText ?? '',
         raLabel: trigger?.querySelector('.dra-select-value')?.textContent ?? '',
         raDisabled: Boolean(trigger?.disabled),
+        hasIndexModel: !!document.querySelector('#dra-index-model'),
+        hasAutoAsk: !!document.querySelector('#dra-auto-ask'),
+        hasTracking: !!document.querySelector('#dra-tracking-days'),
       };
     })()`);
-    assert.doesNotMatch(settingsModels.text, /跟随部署默认/);
+    assert.equal(settingsModels.hasIndexModel, true, 'settings expose a separate index model');
+    assert.equal(settingsModels.hasAutoAsk, true, 'settings expose the auto-ask policy');
+    assert.equal(settingsModels.hasTracking, true, 'settings expose the tracking window');
+    assert.match(settingsModels.text, /新建和分叉/);
+    assert.match(settingsModels.text, /索引模型/);
     if (!settingsModels.raDisabled) {
       assert.ok(
         settingsModels.raLabel && settingsModels.raLabel !== '选择模型',
@@ -784,12 +856,19 @@ async function main() {
     await screenshot('05-untracked-long');
     await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
 
-    // History modal has both tabs.
-    await evaluate("document.querySelector('button[title=\\\"与 RA 的对话历史\\\"]')?.click()");
+    // History is the dispatch audit view plus a direct RA-session entry; the
+    // duplicate conversation tab and manual refresh are gone.
+    await evaluate("document.querySelector('button[title=\\\"派发记录\\\"]')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
     const history = await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''");
     assert.match(history, /派发记录/);
-    assert.match(history, /与 RA 的对话/);
+    assert.match(history, /打开 RA 会话/);
+    assert.doesNotMatch(history, /与 RA 的对话/);
+    assert.equal(
+      await evaluate(`[...document.querySelectorAll('.dra-modal button')].some((item) => item.textContent.trim() === '刷新')`),
+      false,
+      'history has no manual refresh button',
+    );
     await screenshot('06-history');
     await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
 
@@ -834,19 +913,39 @@ async function main() {
     assert.equal(await evaluate("document.querySelectorAll('.dra-edge').length"), 5);
     await sleep(3400);
 
-    // Compress dialog shows exact usage and never claims success up front.
+    // Compress lives in the detail panel; the button still uses the supplied
+    // 1024×1024 glyph and the dialog shows exact usage.
     const compressed = await evaluate(`(() => {
       const node = [...document.querySelectorAll('.dra-node')].find((item) => item.querySelector('.dra-node-title')?.textContent === '登录页表单校验');
-      node.querySelector('button[title="压缩上下文"]').click();
+      node.click();
       return true;
     })()`);
     assert.equal(compressed, true);
+    await sleep(300);
+    const detailCompressGlyph = await evaluate(`(() => {
+      const button = [...document.querySelectorAll('.dra-detail button')].find((item) => item.textContent.includes('压缩'));
+      const svg = button?.querySelector('svg');
+      return button ? { viewBox: svg?.getAttribute('viewBox'), paths: svg?.querySelectorAll('path').length } : null;
+    })()`);
+    assert.deepEqual(
+      detailCompressGlyph,
+      { viewBox: '0 0 1024 1024', paths: 2 },
+      'detail compress icon comes from the supplied SVG',
+    );
+    await evaluate(`(() => {
+      const button = [...document.querySelectorAll('.dra-detail button')].find((item) => item.textContent.includes('压缩'));
+      button?.click();
+    })()`);
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
     const compressText = await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''");
     assert.match(compressText, /200k/);
     assert.match(compressText, /确认压缩/);
     await screenshot('08-compress');
     await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
+    // Compressing selected the node; clear the manual target so auto mode is
+    // enabled again for the next check.
+    await evaluate("document.querySelector('.dra-manual-clear')?.click()");
+    await waitFor(evaluate, "!document.querySelector('.dra-manual')", 3000);
 
     // Auto toggle keeps its label and uses the panel's custom tooltip.
     await evaluate(`(() => {
@@ -897,17 +996,24 @@ async function main() {
     const afterZoom = await evaluate("document.querySelector('.dra-world')?.style.transform ?? ''");
     assert.notEqual(beforeZoom, afterZoom);
 
-    // Onboarding overlay is a real Host state, not a static mock. Clear the
-    // briefs and retry; the test profile slows each build so the overlay is
-    // observable.
+    // First edit is user-confirmed: reset to the pre-confirmation state, assert
+    // the explanation card, then start the real Host queue.
     await rm(join(PROJECT, '.dsh_RA', 'sessions'), { recursive: true, force: true });
     await fetch(`${server.base}/api/router/api`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', cookie: server.cookie },
-      body: JSON.stringify({ op: 'onboarding', project: PROJECT }),
+      body: JSON.stringify({ op: 'onboarding', project: PROJECT, action: 'reset' }),
     });
     await waitFor(evaluate, "document.body.innerText.includes('首次接入：建立会话索引')", 8000);
+    const onboardingPrompt = await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''");
+    assert.match(onboardingPrompt, /开始索引/);
+    assert.match(onboardingPrompt, /稍后/);
     await screenshot('10-onboarding');
+    await fetch(`${server.base}/api/router/api`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: server.cookie },
+      body: JSON.stringify({ op: 'onboarding', project: PROJECT, action: 'start' }),
+    });
     await waitFor(evaluate, "!document.body.innerText.includes('首次接入：建立会话索引')", 15000);
 
     // Narrow viewport: detail overlays the canvas and nothing overflows.
@@ -972,6 +1078,16 @@ function killPort(port) {
         execFileSync('taskkill.exe', ['/PID', pid, '/T', '/F'], { stdio: 'ignore', windowsHide: true });
       } catch {}
     }
+  } catch {}
+}
+
+function killStrayUiServers() {
+  try {
+    execFileSync('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*--profile ui --no-open*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+    ], { stdio: 'ignore', windowsHide: true });
   } catch {}
 }
 

@@ -9,6 +9,7 @@ import { HistoryIcon, MoreIcon, RouterIcon, SearchIcon, SettingsIcon } from './i
 import {
   CompressModal,
   HistoryModal,
+  IndexBanner,
   OnboardingOverlay,
   SettingsModal,
   StopModal,
@@ -43,6 +44,8 @@ export function RouterPanel({ openSession }) {
   const [viewport, setViewport] = useState({ width: 900, height: 700 });
   const [newIds, setNewIds] = useState(() => new Set());
   const [composerTop, setComposerTop] = useState(0);
+  const [raIssue, setRaIssue] = useState(null);
+  const [clock, setClock] = useState(Date.now());
   const viewportRef = useRef(viewport);
   viewportRef.current = viewport;
   const panelRef = useRef(null);
@@ -56,6 +59,9 @@ export function RouterPanel({ openSession }) {
   const fitKey = useRef('');
   const lastFit = useRef(null);
   const timerRef = useRef(0);
+  const pendingTokens = useRef(new Map());
+  const pendingProject = useRef(null);
+  const settledTokens = useRef(new Set());
 
   const refresh = useCallback(
     async (silent = false) => {
@@ -100,7 +106,9 @@ export function RouterPanel({ openSession }) {
     if (!composer || !key || composerProject.current === key) return;
     composerProject.current = key;
     setMode(composer.mode);
-    setPermissions(composer.permissions);
+    setPermissions(
+      composer.permissions === 'danger-full-access' ? 'danger-full-access' : 'workspace-write',
+    );
     setAuto(!!composer.auto);
   }, [data?.settings?.composer, data?.selectedProject?.project]);
 
@@ -206,6 +214,60 @@ export function RouterPanel({ openSession }) {
     }
   }, [data?.history]);
 
+  // A proposal that disappears without a local confirm/abandon (expired token,
+  // another tab, lastSeq 409) must not take the user's task with it.
+  useEffect(() => {
+    const list = data?.pending ?? [];
+    const projectKey = data?.selectedProject?.project ?? null;
+    const current = new Map(list.map((proposal) => [proposal.token, proposal]));
+    if (pendingProject.current !== projectKey) {
+      pendingProject.current = projectKey;
+      pendingTokens.current = current;
+      return;
+    }
+    for (const [token, proposal] of pendingTokens.current) {
+      if (current.has(token) || settledTokens.current.has(token)) continue;
+      if (proposal.project && projectKey && proposal.project !== projectKey) continue;
+      if (proposal.task) {
+        setTask((value) => (value.trim() ? value : proposal.task));
+        setToast('提议已失效，任务已回到输入框。');
+      }
+    }
+    pendingTokens.current = current;
+  }, [data?.pending, data?.selectedProject?.project, setTask]);
+
+  // The Host records the active task before the Agent starts. If the Agent
+  // goes idle without producing a proposal, surface an actionable failure
+  // instead of a spinner that silently disappeared.
+  useEffect(() => {
+    const task = data?.ra?.task ?? null;
+    const running = !!data?.ra?.running;
+    const hasPending = (data?.pending ?? []).length > 0;
+    if (!task || hasPending) {
+      setRaIssue((current) => (current ? null : current));
+      return;
+    }
+    if (running) {
+      setRaIssue((current) => (current ? null : current));
+      return;
+    }
+    if (Date.now() - Number(task.at || 0) < 8000) {
+      setRaIssue((current) => (current ? null : current));
+      return;
+    }
+    setRaIssue((current) =>
+      current?.kind === 'no-proposal' && current.task?.at === task.at
+        ? current
+        : { kind: 'no-proposal', task },
+    );
+  }, [data?.ra?.task, data?.ra?.running, data?.pending]);
+
+  useEffect(() => {
+    if (!raRunning) return undefined;
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [raRunning]);
+
   const run = async (work, successMessage) => {
     setBusy(true);
     setError(null);
@@ -240,27 +302,56 @@ export function RouterPanel({ openSession }) {
     }
   };
 
+  const manualSend = async (action, atSeq) => {
+    const text = task.trim();
+    if (!text || !selected || disabled) return;
+    try {
+      await run(
+        () =>
+          apiOp('manual', {
+            project: data.selectedProject.project,
+            task: text,
+            action,
+            targetSessionId: action === 'new' ? null : selected.sessionId,
+            atSeq: action === 'fork' ? atSeq : null,
+            composer: { mode, permissions, auto: false },
+          }),
+        '已生成待确认提议。',
+      );
+      setTask('');
+    } catch {
+      // run() already surfaced the error.
+    }
+  };
+
   const confirm = async (proposal) => {
-    await run(async () => {
-      const response = await apiOp('confirm', {
-        project: data.selectedProject.project,
-        token: proposal.token,
-      });
-      const result = response.result;
-      const id = result?.sessionId ?? result?.targetSessionId;
-      if (id) {
-        setNewIds((current) => new Set(current).add(id));
-        window.setTimeout(() => {
-          setNewIds((current) => {
-            const next = new Set(current);
-            next.delete(id);
-            return next;
-          });
-        }, 2400);
-        if (result.result === 'forked' || result.result === 'created') setSelectedId(id);
-      }
-      return response;
-    }, '已确认并发送。').catch(() => {});
+    try {
+      await run(async () => {
+        const response = await apiOp('confirm', {
+          project: data.selectedProject.project,
+          token: proposal.token,
+        });
+        const result = response.result;
+        const id = result?.sessionId ?? result?.targetSessionId;
+        if (id) {
+          setNewIds((current) => new Set(current).add(id));
+          window.setTimeout(() => {
+            setNewIds((current) => {
+              const next = new Set(current);
+              next.delete(id);
+              return next;
+            });
+          }, 2400);
+          if (result.result === 'forked' || result.result === 'created') setSelectedId(id);
+        }
+        return response;
+      }, '已确认并发送。');
+      settledTokens.current.add(proposal.token);
+    } catch {
+      // target-changed / expired / 409: keep the task in the input so it is
+      // not lost while the user re-judges or picks another target.
+      if (proposal.task) setTask((value) => (value.trim() ? value : proposal.task));
+    }
   };
 
   const choose = async (proposal, atSeq) => {
@@ -271,16 +362,83 @@ export function RouterPanel({ openSession }) {
   };
 
   const abandon = async (proposal) => {
-    await run(
-      () => apiOp('abandon', { project: data.selectedProject.project, token: proposal.token }),
-      '提议已取消。',
-    ).catch(() => {});
+    try {
+      await run(
+        () => apiOp('abandon', { project: data.selectedProject.project, token: proposal.token }),
+        '提议已取消，任务已回到输入框。',
+      );
+      settledTokens.current.add(proposal.token);
+      if (proposal.task) setTask((value) => (value.trim() ? value : proposal.task));
+    } catch {
+      // run() already surfaced the error.
+    }
   };
 
   const answer = async (proposal, value) => {
+    try {
+      await run(
+        () => apiOp('answer', { project: data.selectedProject.project, token: proposal.token, answer: value }),
+        '已回答 Router。',
+      );
+      settledTokens.current.add(proposal.token);
+    } catch {
+      // run() already surfaced the error.
+    }
+  };
+
+  const retry = async (proposal, note) => {
+    try {
+      await run(
+        () => apiOp('retry', { project: data.selectedProject.project, token: proposal.token, note }),
+        note ? '已带着纠正交给 Router 重新判断。' : '已请 Router 重新判断。',
+      );
+      settledTokens.current.add(proposal.token);
+    } catch {
+      // run() already surfaced the error.
+    }
+  };
+
+  const retarget = async (proposal, sessionId) => {
     await run(
-      () => apiOp('answer', { project: data.selectedProject.project, token: proposal.token, answer: value }),
-      '已回答 Router。',
+      () => apiOp('retarget', { project: data.selectedProject.project, token: proposal.token, sessionId }),
+      '目标已更新。',
+    ).catch(() => {});
+  };
+
+  const cancelTask = async () => {
+    await run(
+      () => apiOp('cancelTask', { project: data.selectedProject.project }),
+      '已取消 Router 的判断。',
+    ).catch(() => {});
+    setRaIssue(null);
+  };
+
+  const retryTask = async () => {
+    const failed = raIssue?.task;
+    if (!failed?.task) return;
+    setRaIssue(null);
+    await run(
+      () =>
+        apiOp('ask', {
+          project: data.selectedProject.project,
+          task: failed.task,
+          composer: failed.composer ?? { mode, permissions, auto },
+        }),
+      '已重新交给 Router。',
+    ).catch(() => {});
+  };
+
+  const startIndex = async (action = 'start') => {
+    await run(
+      () => apiOp('onboarding', { project: data.selectedProject.project, action }),
+      action === 'retry' ? '正在重试索引…' : '正在建立会话索引…',
+    ).catch(() => {});
+  };
+
+  const skipIndex = async () => {
+    await run(
+      () => apiOp('onboarding', { project: data.selectedProject.project, action: 'skip' }),
+      '稍后可从画布上方的提示条开始索引。',
     ).catch(() => {});
   };
 
@@ -387,7 +545,7 @@ export function RouterPanel({ openSession }) {
           }}
           options={(data?.projects ?? []).map((row) => ({
             value: row.project,
-            label: `${row.name} · ${row.sessions}`,
+            label: `${row.name} · ${row.sessions} 会话 · ${row.tracked ?? 0} 跟踪`,
           }))}
           placeholder={(data?.projects ?? []).length === 0 ? '无项目' : '选择项目'}
           disabled={(data?.projects ?? []).length === 0}
@@ -406,7 +564,7 @@ export function RouterPanel({ openSession }) {
           />
         </div>
         <div className="dra-head-actions">
-          <button className="dra-icon-btn" type="button" title="与 RA 的对话历史" onClick={() => setModal('history')}>
+          <button className="dra-icon-btn" type="button" title="派发记录" onClick={() => setModal('history')}>
             <HistoryIcon />
           </button>
           <button className="dra-icon-btn" type="button" title="Router 设置" onClick={() => setModal('settings')}>
@@ -426,6 +584,8 @@ export function RouterPanel({ openSession }) {
           </div>
         ) : null}
 
+        <IndexBanner onboarding={onboarding} onStart={startIndex} />
+
         {layout.nodes.length > 0 ? (
           <Canvas
             layout={layout}
@@ -437,8 +597,6 @@ export function RouterPanel({ openSession }) {
             search={search}
             onSelect={setSelectedId}
             onOpen={(id) => openSession?.(id)}
-            onCompress={(session) => setModal({ type: 'compress', session })}
-            canCompress={data?.probe?.compact !== false}
             onViewportChange={handleViewport}
             onFit={fitAll}
             onLatest={latest}
@@ -454,7 +612,7 @@ export function RouterPanel({ openSession }) {
             </h3>
             <p>
               {data?.selectedProject
-                ? '默认只跟踪最近 7 天有活动的会话。可以去“未跟踪会话”恢复更早的会话，或先在 DSH 中继续一个会话。'
+                ? `只跟踪最近 ${data?.settings?.trackingDays ?? 7} 天有活动的会话。可以去“未跟踪会话”恢复更早的会话，或先在 DSH 中继续一个会话。`
                 : '先在 DSH 中打开一个项目并创建会话。'}
             </p>
           </div>
@@ -475,7 +633,7 @@ export function RouterPanel({ openSession }) {
         <div className="dra-composer-wrap" ref={composerRef}>
           {pendingList.length > 0 ? (
             <div className="dra-proposals">
-              {pendingList.map((proposal) => {
+              {pendingList.map((proposal, index) => {
                 const target = proposal.targetSessionId
                   ? tree.sessions.find((row) => row.sessionId === proposal.targetSessionId) ?? null
                   : null;
@@ -484,11 +642,16 @@ export function RouterPanel({ openSession }) {
                     key={proposal.token}
                     proposal={proposal}
                     target={target}
+                    sessions={tree.sessions}
+                    index={index}
+                    total={pendingList.length}
                     busy={busy}
                     onConfirm={confirm}
                     onChoose={choose}
                     onAbandon={abandon}
                     onAnswer={answer}
+                    onRetry={retry}
+                    onRetarget={retarget}
                   />
                 );
               })}
@@ -497,7 +660,42 @@ export function RouterPanel({ openSession }) {
             <div className="dra-proposal">
               <div className="dra-proposal-head">
                 <span className="dra-spin" />
-                <span>Router 正在查看会话并判断…</span>
+                <span>
+                  Router 正在查看会话并判断…
+                  {data?.ra?.task?.at ? ` ${Math.max(0, Math.floor((clock - Number(data.ra.task.at)) / 1000))}s` : ''}
+                </span>
+                <span className="dra-spacer" />
+                <button className="dra-btn dra-btn-sm" type="button" disabled={busy} onClick={cancelTask}>
+                  取消
+                </button>
+              </div>
+              {data?.ra?.task?.at && clock - Number(data.ra.task.at) > 60000 ? (
+                <p className="dra-proposal-reason">
+                  已经超过 60 秒。可以继续等，或取消后手动指定目标。
+                </p>
+              ) : null}
+            </div>
+          ) : raIssue ? (
+            <div className="dra-proposal" data-issue="true">
+              <div className="dra-proposal-head">
+                <span className="dra-badge" data-tone="warn">Router 未完成</span>
+                <span>没有生成待确认提议</span>
+              </div>
+              <p className="dra-proposal-reason">
+                这一轮已经结束，但没有提交提议。可能是模型不支持工具调用、超时或判断失败。
+                可以重试、换一个 Router 模型，或选中画布节点后手动派发。
+              </p>
+              <div className="dra-proposal-actions">
+                <button className="dra-btn dra-btn-primary dra-btn-sm" type="button" disabled={busy} onClick={retryTask}>
+                  重新判断
+                </button>
+                <button className="dra-btn dra-btn-sm" type="button" onClick={() => setModal('settings')}>
+                  换 Router 模型
+                </button>
+                <span className="dra-spacer" />
+                <button className="dra-btn dra-btn-ghost dra-btn-sm" type="button" disabled={busy} onClick={cancelTask}>
+                  取消任务
+                </button>
               </div>
             </div>
           ) : null}
@@ -514,6 +712,9 @@ export function RouterPanel({ openSession }) {
             disabled={disabled}
             disabledReason={disabledReason}
             onSend={send}
+            onManualSend={manualSend}
+            manualTarget={selected}
+            onClearTarget={() => setSelectedId(null)}
             planAvailable={data?.probe?.planMode !== false}
             permissionAvailable={data?.probe?.permissionPresets !== false}
           />
@@ -522,7 +723,9 @@ export function RouterPanel({ openSession }) {
         <OnboardingOverlay
           onboarding={onboarding}
           currentTitle={currentTitle}
-          onRetry={() => run(() => apiOp('onboarding', { project: data.selectedProject.project }), '正在重试索引…').catch(() => {})}
+          trackingDays={data?.settings?.trackingDays ?? 7}
+          onStart={() => startIndex('start')}
+          onSkip={skipIndex}
         />
         <Toast message={toast} />
       </div>
@@ -539,7 +742,10 @@ export function RouterPanel({ openSession }) {
         <HistoryModal
           ra={data?.ra}
           history={data?.history}
-          onRefresh={() => refresh(false)}
+          onOpenRA={(id) => {
+            setModal(null);
+            openSession?.(id);
+          }}
           onClose={() => setModal(null)}
         />
       ) : null}

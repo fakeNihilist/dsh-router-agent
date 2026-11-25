@@ -15,8 +15,8 @@
   "ok": true,
   "probe": { "...": "capability flags" },
   "blockers": [],
-  "projects": [{ "project": "D:/code/example-project", "name": "example-project", "sessions": 22, "lastActiveAt": 1795 }],
-  "selectedProject": { "project": "D:/code/example-project", "name": "example-project", "sessions": 22, "lastActiveAt": 1795 },
+  "projects": [{ "project": "D:/code/example-project", "name": "example-project", "sessions": 22, "tracked": 18, "lastActiveAt": 1795 }],
+  "selectedProject": { "project": "D:/code/example-project", "name": "example-project", "sessions": 22, "tracked": 18, "lastActiveAt": 1795 },
   "tree": {
     "project": "D:/code/example-project",
     "generatedAt": "2026-11-19T...",
@@ -46,12 +46,15 @@
   "settings": {
     "layout": "vertical",
     "raModel": null,
+    "indexModel": null,
     "defaultSessionModel": null,
+    "autoAsk": "keep",
+    "trackingDays": 7,
     "composer": { "mode": "standard", "permissions": "workspace-write", "auto": false }
   },
   "models": { "default": { "provider": "deepseek-official", "model": "deepseek-flash" }, "groups": [] },
   "onboarding": { "status": "complete", "total": 13, "done": 13, "current": null, "failed": [] },
-  "ra": { "sessionId": "session-...", "running": false, "messages": [{ "role": "user", "text": "...", "at": 1795 }], "task": null },
+  "ra": { "sessionId": "session-...", "running": false, "task": null },
   "pending": [],
   "history": []
 }
@@ -63,7 +66,9 @@
 - `lastActiveAt` 优先取日志末尾事件时间（不是最后一次用户提问时间）。
 - `boundaries` 最多下发最近 100 条；`boundaryCount` 是完整边界数（分叉选择/校验仍可在服务端使用完整列表）。
 - 树行**不包含** brief 的 `overview`，详情里也不渲染概览。
-- `ra.messages` 只包含用户/助手文本，不包含 reasoning 和工具卡片；`ra.task` 在提议确认/自动执行/取消后清空。
+- `projects[].sessions` 是项目全部可跟踪会话数，`tracked` 是当前跟踪窗口内（或已固定）的数量；项目下拉同时显示两者。`tracked` 只从各项目 sidecar 的 `trackingDays/stopped/pinned` 计算，不会为了计数读取全部项目树。
+- `onboarding.status` 为 `awaiting | running | complete | skipped | failed`。`awaiting` 表示等待用户确认索引；Host 不会自动调用模型。`skipped` 表示用户选择稍后，此时仍可路由。
+- `ra.task` 是当前等待 RA 判断的任务（`task/composer/at`）；`running` 为 true 时可以取消。panel 不再拉取 RA 对话文本。
 - 显式 `project` 不存在时返回空 `selectedProject`（只读空态）；写操作返回 `404 project-not-found`。
 
 ### `GET /api/router/probe`
@@ -97,8 +102,40 @@ content-type: application/json
 
 - 首次调用创建/恢复该项目的 Router 会话（`agentPreset: 'router'`）。
 - 任务会包装成 `项目/用户任务/派发设置` 发给 RA；RA 自己调工具。
-- 首次索引未完成时返回 `409 onboarding-running`。
-- 自动模式下 RA 不能 `ask`。
+- 只有索引正在建立时返回 `409 onboarding-running`；`awaiting` / `skipped` 仍允许先路由，RA 先用标题、`ra_brief` 按需构建候选会话的索引。
+- 自动模式的追问策略由 `settings.autoAsk` 决定：`keep`（默认，仍生成待回答的 `ask` 提议）、`suggest`（RA 必须给 `options`，Host 自动取第一个回答并继续判断）、`decide`（禁止 `ask`，要求直接 route/fork/new）。
+
+### `manual`
+
+```json
+{ "op": "manual", "project": "...", "task": "手动发到父会话", "action": "route", "targetSessionId": "session-p", "atSeq": 16, "composer": { "mode": "standard", "permissions": "workspace-write" } }
+```
+
+用户选中画布节点后的手动派发兜底。`action` 只接受 `route | fork | new`；`fork` 省略 `atSeq` 时取目标最后一个 `turn/end`。只写一条 `manual: true`、`auto: false` 的 pending 提议，仍然必须 `confirm`，因此 token/项目/expiry/`lastSeq` 校验与 RA 提议完全相同；手动派发不会自动执行。
+
+### `retry`
+
+```json
+{ "op": "retry", "project": "...", "token": "<uuid>", "note": "应该分叉，不要改父会话" }
+```
+
+把原提议标为 `abandoned`（历史结果 `revised`），把 `任务原文 + 设置 + 用户要求重新判断：...` 发回 RA。`note` 最长 500 字，可为空。prompt 发送失败会把提议恢复为 pending。
+
+### `retarget`
+
+```json
+{ "op": "retarget", "project": "...", "token": "<uuid>", "sessionId": "session-c" }
+```
+
+只对 pending 的 `route | fork` 提议有效。重写目标标题、`targetLastSeq`、目标当前计划/权限；`fork` 会改用新目标的最后一个边界。仍需 `confirm`。
+
+### `cancelTask`
+
+```json
+{ "op": "cancelTask", "project": "..." }
+```
+
+清除该项目的 active task；如果 RA 正在运行，调用 `agent.cancel({ kind: 'user' })` 中止当前轮并清空排队输入。返回 `{ ok, canceled, hadTask }`。
 
 ### `confirm`
 
@@ -185,12 +222,15 @@ content-type: application/json
   "settings": {
     "layout": "horizontal",
     "raModel": { "provider": "deepseek-official", "model": "deepseek-flash" },
-    "defaultSessionModel": { "provider": "deepseek-official", "model": "deepseek-chat" }
+    "indexModel": { "provider": "deepseek-official", "model": "deepseek-chat" },
+    "defaultSessionModel": { "provider": "deepseek-official", "model": "deepseek-chat" },
+    "autoAsk": "keep",
+    "trackingDays": 14
   }
 }
 ```
 
-布局只接受 `vertical | horizontal`；模型只接受 `{provider, model, reasoningEffort?}`。字段缺省表示“保持不变”，显式 `null` 表示清空并跟随部署默认；只改 `raModel` 不会重置 `layout`。保存后如果 RA 会话 live，立即 `agent.model.select`；清空时尝试选择模型目录默认；否则下次 resume 应用。
+布局只接受 `vertical | horizontal`；模型只接受 `{provider, model, reasoningEffort?}`；`autoAsk` 只接受 `keep | suggest | decide`；`trackingDays` 接受 1–365 的整数。字段缺省表示“保持不变”，显式 `null` 表示清空并跟随部署默认；只改 `raModel` 不会重置 `layout`。`raModel` 只作用于 Router 对话；`indexModel` 只作用于 brief 构建/刷新（为空时跟随模型目录默认）。保存 `raModel` 后如果 RA 会话 live，立即 `agent.model.select`；清空时尝试选择模型目录默认。保存 `trackingDays` 会同步旧的 `state.tracking.days` 并清空项目列表缓存。
 
 ### `rename`
 
@@ -205,13 +245,13 @@ content-type: application/json
 ```json
 { "op": "untracked", "project": "..." }
 { "op": "history", "project": "...", "limit": 50 }
-{ "op": "onboarding", "project": "..." }
+{ "op": "onboarding", "project": "...", "action": "start|skip|retry" }
 { "op": "refresh", "project": "..." }
 ```
 
 - `untracked`：`{ ok, items }`，reason 为 `stopped | older`。
 - `history`：`{ ok, items }`，最新在前。
-- `onboarding`：把状态置回 `idle` 并复用正常首次接入队列；已完成的 brief 会跳过（断点续跑）。
+- `onboarding`：`start` 启动或续跑首次索引（已完成的 brief 会跳过）；`skip` 写 `status: skipped`，仍允许路由；`retry` 重新启动 dirty/failed 项。`reset` 仅在 `config.dev` 下可用，把状态置回 `awaiting` 供验收测试使用。
 - `refresh`：返回完整 state。
 
 ## 数据 schema
@@ -230,12 +270,21 @@ content-type: application/json
   "pinned": { "session-old": true },
   "lineage": { "session-child": "session-parent" },
   "titles": { "session-x": { "title": "...", "source": "manual", "updatedAt": "..." } },
-  "settings": { "...": "..." },
-  "onboarding": { "status": "idle|running|complete", "total": 13, "done": 13, "current": null, "failed": [] },
-  "summary": { "session-x": { "status": "ready|fallback|pending", "summarizedThroughSeq": 19, "title": "...", "lastActiveAt": 1795 } },
-  "lastSeen": { "session-x": 1795 }
+  "settings": {
+    "layout": "vertical",
+    "raModel": null,
+    "indexModel": null,
+    "defaultSessionModel": null,
+    "autoAsk": "keep",
+    "trackingDays": 7,
+    "composer": { "mode": "standard", "permissions": "workspace-write", "auto": false }
+  },
+  "onboarding": { "status": "awaiting|running|complete|skipped|failed", "total": 13, "done": 13, "current": null, "failed": [] },
+  "summary": { "session-x": { "status": "ready|fallback|pending", "summarizedThroughSeq": 19, "title": "...", "lastActiveAt": 1795 } }
 }
 ```
+
+`tracking.days` 是旧字段，仍与新 `settings.trackingDays` 同步写入；读取以 `settings.trackingDays` 为准。`lastSeen` 已移除。
 
 ### brief
 
@@ -282,6 +331,8 @@ content-type: application/json
   "reason": "为什么这样选",
   "composer": { "mode": "standard", "permissions": "workspace-write", "auto": false },
   "auto": false,
+  "manual": false,
+  "answer": null,
   "status": "pending|executing|confirmed|auto|abandoned|answered|expired|target-changed|failed",
   "claimedAt": 1795,
   "resultSessionId": "session-...",
@@ -291,7 +342,7 @@ content-type: application/json
 }
 ```
 
-`status=executing` 是确认/自动执行的认领态，只有持锁的调用会推进；15 分钟仍为 executing 会被视为中断失败。fork/new 失败时 `resultSessionId` 记录已创建的会话，避免重试重复创建。
+`status=executing` 是确认/自动执行的认领态，只有持锁的调用会推进；15 分钟仍为 executing 会被视为中断失败。fork/new 失败时 `resultSessionId` 记录已创建的会话，避免重试重复创建。`manual: true` 表示由画布手动派发；`answer` 记录追问/自动建议项的回答。
 
 ### dispatch.jsonl
 
@@ -306,7 +357,7 @@ content-type: application/json
   "atSeq": 16,
   "turn": 2,
   "reason": "...（已脱敏）",
-  "result": "sent|created|forked|auto|abandoned|asked|failed",
+  "result": "sent|created|forked|auto|abandoned|revised|asked|failed",
   "mode": "confirm|auto|manual",
   "composer": { "...": "..." },
   "error": null
@@ -355,9 +406,9 @@ content-type: application/json
 | HTTP | code | 含义 |
 |---|---|---|
 | 400 | `bad-request` / `bad-json` / `unknown-op` / `bad-project` / `bad-token` | 请求格式错误 |
-| 400 | `empty-task` / `bad-boundary` / `not-a-fork` / `not-an-ask` / `empty-answer` | 业务参数错误 |
+| 400 | `empty-task` / `bad-boundary` / `not-a-fork` / `not-an-ask` / `not-retargetable` / `empty-answer` | 业务参数错误 |
 | 404 | `project-not-found` / `session-not-tracked` / `proposal-not-found` | 目标不存在 |
-| 409 | `onboarding-running` | 首次索引未完成 |
+| 409 | `onboarding-running` | 首次索引正在建立（稍后可路由） |
 | 409 | `proposal-not-pending` / `proposal-executing` / `proposal-expired` | 提议已处理/执行中/过期 |
 | 409 | `target-changed` / `target-unreadable` | 目标 lastSeq 变了 / 读不到目标进度 |
 | 409 | `ra-busy` / `ra-unavailable` | RA 会话被占用/暂时不可用 |

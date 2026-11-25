@@ -148,7 +148,8 @@ export class BriefPipeline {
 
   async model() {
     const state = await this.store.read();
-    if (state.settings?.raModel?.provider && state.settings?.raModel?.model) return state.settings.raModel;
+    const selection = state.settings?.indexModel;
+    if (selection?.provider && selection?.model) return selection;
     try {
       const catalog = await this.ctx.sessionController.modelCatalog();
       if (catalog?.default?.provider && catalog?.default?.model) return catalog.default;

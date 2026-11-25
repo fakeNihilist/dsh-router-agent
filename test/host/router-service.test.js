@@ -243,6 +243,8 @@ async function createHarness() {
   const fakeAgent = { id: 'ra', session: { header: { cwd: project, agentPreset: 'router' } }, status: 'idle' };
 
   const waitComplete = async () => {
+    // First index is user-confirmed now; tests opt in explicitly.
+    await service.onboardingOp({ project, action: 'start' });
     for (let i = 0; i < 100; i += 1) {
       const state = await service.state({ project });
       if (state.onboarding?.status === 'complete') return state;
@@ -283,6 +285,9 @@ test('state indexes only the last 7 days, builds edges and untracked rows', asyn
     assert.equal(state.tree.edges[0].to, 'c');
     assert.equal(state.tree.sessions.find((row) => row.sessionId === 'c').parentSessionId, 'p');
     assert.ok(state.untracked.some((row) => row.sessionId === 'old' && row.reason === 'older'));
+    const project = state.projects.find((row) => row.project === harness.project);
+    assert.equal(project.sessions, 4);
+    assert.equal(project.tracked, 2);
   } finally {
     await harness.cleanup();
   }
@@ -316,10 +321,39 @@ test('switching projects reads only that project in the tree and untracked list'
   }
 });
 
-test('auto mode refuses an ask proposal', async () => {
+test('auto mode keeps asking under the default policy', async () => {
   const harness = await createHarness();
   try {
     await harness.waitComplete();
+    harness.service.activeTasks.set(harness.service.taskKey(harness.project), {
+      task: '自动任务',
+      composer: { mode: 'standard', permissions: 'workspace-write', auto: true },
+      raSessionId: 'ra',
+      at: Date.now(),
+    });
+    const proposal = await harness.service.raPropose(harness.fakeAgent, {
+      action: 'ask',
+      question: '选哪个？',
+      options: ['继续', '新建'],
+      reason: '不确定',
+    });
+    assert.ok(proposal.token);
+    const store = harness.service.storeFor(harness.project);
+    const saved = await store.getProposal(proposal.token);
+    assert.equal(saved.status, 'pending');
+    assert.equal(saved.auto, false);
+    assert.ok((await harness.service.pendingFor(store)).some((row) => row.token === proposal.token));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('auto mode can forbid asking and refuse an ask proposal', async () => {
+  const harness = await createHarness();
+  try {
+    await harness.waitComplete();
+    const store = harness.service.storeFor(harness.project);
+    await store.setSettings({ autoAsk: 'decide' });
     harness.service.activeTasks.set(harness.service.taskKey(harness.project), {
       task: '自动任务',
       composer: { mode: 'standard', permissions: 'workspace-write', auto: true },
@@ -332,8 +366,40 @@ test('auto mode refuses an ask proposal', async () => {
         question: '选哪个？',
         reason: '不确定',
       }),
-      /自动执行已开启/,
+      /交给 RA 判断/,
     );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('auto mode can answer an ask with its first suggestion', async () => {
+  const harness = await createHarness();
+  try {
+    await harness.waitComplete();
+    const store = harness.service.storeFor(harness.project);
+    await store.setSettings({ autoAsk: 'suggest' });
+    harness.service.activeTasks.set(harness.service.taskKey(harness.project), {
+      task: '自动任务',
+      composer: { mode: 'standard', permissions: 'workspace-write', auto: true },
+      raSessionId: 'ra',
+      at: Date.now(),
+    });
+    const proposal = await harness.service.raPropose(harness.fakeAgent, {
+      action: 'ask',
+      question: '选哪个？',
+      options: ['继续父会话', '新建会话'],
+      reason: '不确定',
+    });
+    assert.equal(proposal.executed, true);
+    assert.equal(proposal.autoAnswered, true);
+    assert.equal(proposal.answer, '继续父会话');
+    assert.match(harness.prompts.at(-1).content[0].text, /自动使用建议项/);
+    const saved = await store.getProposal(proposal.token);
+    assert.equal(saved.status, 'answered');
+    assert.equal(saved.answer, '继续父会话');
+    const history = await store.history(5);
+    assert.equal(history.at(-1).mode, 'auto');
   } finally {
     await harness.cleanup();
   }
@@ -389,6 +455,166 @@ test('route proposal confirms token and sends the task', async () => {
     assert.equal(result.result.result, 'sent');
     assert.equal(harness.prompts.at(-1).sessionId, 'p');
     assert.equal(harness.prompts.at(-1).content[0].text, '继续做登录页');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('first index waits for confirmation and skipping it still allows routing', async () => {
+  const harness = await createHarness();
+  try {
+    const initial = await harness.service.state({ project: harness.project });
+    assert.equal(initial.onboarding.status, 'awaiting');
+    assert.ok(initial.onboarding.total > 0);
+    const store = harness.service.storeFor(harness.project);
+    assert.equal(await store.getBrief('p'), null);
+    const skipped = await harness.service.onboardingOp({ project: harness.project, action: 'skip' });
+    assert.equal(skipped.onboarding.status, 'skipped');
+    const asked = await harness.service.ask({
+      project: harness.project,
+      task: '先路由看看',
+      composer: { mode: 'standard', permissions: 'workspace-write', auto: false },
+    });
+    assert.equal(asked.accepted, true);
+    assert.equal(harness.prompts.at(-1).sessionId, asked.raSessionId);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('manual dispatch creates a normal pending proposal and sends after confirmation', async () => {
+  const harness = await createHarness();
+  try {
+    await harness.waitComplete();
+    const created = await harness.service.manual({
+      project: harness.project,
+      task: '手动发到父会话',
+      action: 'route',
+      targetSessionId: 'p',
+      composer: { mode: 'standard', permissions: 'workspace-write', auto: true },
+    });
+    const store = harness.service.storeFor(harness.project);
+    const proposal = await store.getProposal(created.token);
+    assert.equal(proposal.status, 'pending');
+    assert.equal(proposal.auto, false);
+    assert.equal(proposal.manual, true);
+    assert.equal(
+      proposal.targetLastSeq,
+      (await harness.service.findRow(harness.project, 'p')).row.lastSeq,
+    );
+    const result = await harness.service.confirm({ project: harness.project, token: created.token });
+    assert.equal(result.result.result, 'sent');
+    assert.equal(harness.prompts.at(-1).sessionId, 'p');
+    assert.equal(harness.prompts.at(-1).content[0].text, '手动发到父会话');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('manual fork defaults to the latest boundary and manual retarget moves the target', async () => {
+  const harness = await createHarness();
+  try {
+    await harness.waitComplete();
+    const created = await harness.service.manual({
+      project: harness.project,
+      task: '手动分叉',
+      action: 'fork',
+      targetSessionId: 'p',
+      composer: { mode: 'plan', permissions: 'workspace-write' },
+    });
+    const store = harness.service.storeFor(harness.project);
+    let proposal = await store.getProposal(created.token);
+    const parent = (await harness.service.findRow(harness.project, 'p')).row;
+    assert.equal(proposal.atSeq, parent.boundaries.at(-1).atSeq);
+    assert.equal(proposal.turn, parent.boundaries.at(-1).turn);
+    await harness.service.retarget({
+      project: harness.project,
+      token: created.token,
+      sessionId: 'c',
+    });
+    proposal = await store.getProposal(created.token);
+    const child = (await harness.service.findRow(harness.project, 'c')).row;
+    assert.equal(proposal.targetSessionId, 'c');
+    assert.equal(proposal.atSeq, child.boundaries.at(-1).atSeq);
+    assert.equal(proposal.composer.mode, 'plan');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('retry abandons the proposal and asks the RA to judge again with the correction', async () => {
+  const harness = await createHarness();
+  try {
+    await harness.waitComplete();
+    const proposal = await harness.service.raPropose(harness.fakeAgent, {
+      action: 'route',
+      task: '继续做登录页',
+      targetSessionId: 'p',
+      reason: '同一功能',
+    });
+    await harness.service.retry({
+      project: harness.project,
+      token: proposal.token,
+      note: '应该分叉，不要改父会话',
+    });
+    const store = harness.service.storeFor(harness.project);
+    assert.equal((await store.getProposal(proposal.token)).status, 'abandoned');
+    assert.match(harness.prompts.at(-1).content[0].text, /应该分叉/);
+    const history = await store.history(5);
+    assert.equal(history.at(-1).result, 'revised');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('cancel task clears the active slot and cancels a running RA', async () => {
+  const harness = await createHarness();
+  try {
+    await harness.waitComplete();
+    const store = harness.service.storeFor(harness.project);
+    await store.setRASession('ra');
+    let canceled = 0;
+    harness.live.set('ra', {
+      id: 'ra',
+      status: 'running',
+      session: { header: { cwd: harness.project } },
+      cancel() {
+        canceled += 1;
+      },
+    });
+    harness.service.activeTasks.set(harness.service.taskKey(harness.project), {
+      task: '卡住的任务',
+      composer: { mode: 'standard', permissions: 'workspace-write', auto: false },
+      raSessionId: 'ra',
+      at: Date.now(),
+    });
+    const result = await harness.service.cancelTask({ project: harness.project });
+    assert.equal(result.canceled, true);
+    assert.equal(canceled, 1);
+    assert.equal(harness.service.activeTask(harness.project), null);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('settings persist auto-ask, index model and the tracking window', async () => {
+  const harness = await createHarness();
+  try {
+    await harness.waitComplete();
+    const saved = await harness.service.saveSettings({
+      project: harness.project,
+      settings: {
+        autoAsk: 'suggest',
+        indexModel: { provider: 'p', model: 'm2' },
+        trackingDays: 14,
+      },
+    });
+    assert.equal(saved.settings.autoAsk, 'suggest');
+    assert.deepEqual(saved.settings.indexModel, { provider: 'p', model: 'm2' });
+    assert.equal(saved.settings.trackingDays, 14);
+    const state = await harness.service.state({ project: harness.project });
+    assert.equal(state.settings.trackingDays, 14);
+    assert.equal((await harness.service.pipelineFor(harness.project).model()).model, 'm2');
   } finally {
     await harness.cleanup();
   }
@@ -1030,7 +1256,7 @@ test('an indexing failure becomes a visible failed onboarding state', async () =
     const store = harness.service.storeFor(harness.project);
     const pipeline = harness.service.pipelineFor(harness.project);
     const original = pipeline.indexRows;
-    await store.onboarding({ status: 'idle', total: 0, done: 0, current: null, failed: [] });
+    await store.onboarding({ status: 'running', total: 0, done: 0, current: null, failed: [] });
     pipeline.indexRows = async () => {
       throw new Error('disk full');
     };

@@ -1,11 +1,41 @@
 import React from 'react';
-import { CompressIcon } from './icons.jsx';
 
 function level(percent) {
   if (percent === null || percent === undefined) return 'ok';
   if (percent >= 85) return 'high';
   if (percent >= 60) return 'warn';
   return 'ok';
+}
+
+/** Compact ring gauge for context usage; compression lives in the detail panel. */
+function ContextRing({ percent }) {
+  const known = percent !== null && percent !== undefined;
+  const value = Math.min(100, Math.max(0, known ? percent : 0));
+  const radius = 6.5;
+  const circumference = 2 * Math.PI * radius;
+  return (
+    <span
+      className="dra-ring"
+      data-level={level(percent)}
+      data-known={known ? 'true' : 'false'}
+      title={known ? `上下文 ${percent}%` : '上下文未知'}
+    >
+      <svg width={18} height={18} viewBox="0 0 18 18" aria-hidden="true">
+        <circle className="dra-ring-track" cx="9" cy="9" r={radius} />
+        {known ? (
+          <circle
+            className="dra-ring-fill"
+            cx="9"
+            cy="9"
+            r={radius}
+            strokeDasharray={`${circumference} ${circumference}`}
+            strokeDashoffset={circumference * (1 - value / 100)}
+            transform="rotate(-90 9 9)"
+          />
+        ) : null}
+      </svg>
+    </span>
+  );
 }
 
 export function NodeCard({
@@ -18,8 +48,6 @@ export function NodeCard({
   dim,
   onSelect,
   onOpen,
-  onCompress,
-  canCompress = true,
 }) {
   const percent = node.context?.percent;
   return (
@@ -57,24 +85,11 @@ export function NodeCard({
       <div className="dra-node-meta">
         <span>{node.lastActiveLabel}</span>
         <span className="dra-spacer" />
-        <span className="dra-ctx" data-level={level(percent)} title={percent === null ? '上下文未知' : `上下文 ${percent}%`}>
-          <span className="dra-ctx-text">{percent === null || percent === undefined ? '—' : `${percent}%`}</span>
-          <span className="dra-ctx-bar">
-            <i style={{ width: `${Math.min(100, Math.max(0, percent ?? 0))}%` }} />
+        <span className="dra-ctx">
+          <ContextRing percent={percent} />
+          <span className="dra-ctx-text">
+            {percent === null || percent === undefined ? '—' : `${percent}%`}
           </span>
-          <button
-            className="dra-compress"
-            type="button"
-            title={canCompress ? '压缩上下文' : '当前部署不支持压缩'}
-            aria-label="压缩上下文"
-            disabled={!canCompress}
-            onClick={(event) => {
-              event.stopPropagation();
-              onCompress?.(node);
-            }}
-          >
-            <CompressIcon width={13} height={13} />
-          </button>
         </span>
       </div>
     </div>

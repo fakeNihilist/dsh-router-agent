@@ -21,6 +21,9 @@ test('ensure creates the sidecar, gitignore and default settings', async () => {
     const state = await store.read();
     assert.equal(state.settings.layout, 'vertical');
     assert.equal(state.settings.composer.permissions, 'workspace-write');
+    assert.equal(state.settings.autoAsk, 'keep');
+    assert.equal(state.settings.trackingDays, 7);
+    assert.equal(state.onboarding.status, 'awaiting');
     assert.match(await readFile(join(dir, '.dsh_RA', '.gitignore'), 'utf8'), /^\*/);
   });
 });
@@ -78,13 +81,13 @@ test('concurrent updates serialize without losing rows', async () => {
     await Promise.all(
       Array.from({ length: 20 }, (_, index) =>
         store.update((state) => {
-          state.lastSeen[`s${index}`] = index;
+          state.stopped[`s${index}`] = { at: index };
         }),
       ),
     );
     const state = await store.read();
-    assert.equal(Object.keys(state.lastSeen).length, 20);
-    assert.equal(state.lastSeen.s19, 19);
+    assert.equal(Object.keys(state.stopped).length, 20);
+    assert.equal(state.stopped.s19.at, 19);
   });
 });
 
@@ -96,17 +99,42 @@ test('two stores on one directory merge updates instead of overwriting', async (
     await Promise.all([
       ...Array.from({ length: 10 }, (_, index) =>
         left.update((state) => {
-          state.lastSeen[`l${index}`] = index;
+          state.stopped[`l${index}`] = { at: index };
         }),
       ),
       ...Array.from({ length: 10 }, (_, index) =>
         right.update((state) => {
-          state.lastSeen[`r${index}`] = index;
+          state.stopped[`r${index}`] = { at: index };
         }),
       ),
     ]);
     const state = await left.read();
-    assert.equal(Object.keys(state.lastSeen).length, 20);
+    assert.equal(Object.keys(state.stopped).length, 20);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an older sidecar drops lastSeen and folds tracking.days into settings', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-ra-store-'));
+  try {
+    await mkdir(join(dir, '.dsh_RA'), { recursive: true });
+    await writeFile(
+      join(dir, '.dsh_RA', 'state.json'),
+      JSON.stringify({
+        version: 1,
+        tracking: { days: 30 },
+        settings: { layout: 'vertical' },
+        onboarding: { status: 'idle' },
+        lastSeen: { s1: 1 },
+      }),
+      'utf8',
+    );
+    const store = new ProjectStore(dir);
+    const state = await store.read();
+    assert.equal(state.lastSeen, undefined);
+    assert.equal(state.settings.trackingDays, 30);
+    assert.equal(state.onboarding.status, 'awaiting');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

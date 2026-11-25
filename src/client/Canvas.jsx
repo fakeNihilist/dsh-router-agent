@@ -12,11 +12,9 @@ export function Canvas({
   search,
   onSelect,
   onOpen,
-  onCompress,
   onViewportChange,
   onFit,
   onLatest,
-  canCompress = true,
 }) {
   const canvasRef = useRef(null);
   const [viewport, setViewport] = useState({ width: 900, height: 700 });
@@ -141,8 +139,6 @@ export function Canvas({
             dim={dimmed(node)}
             onSelect={onSelect}
             onOpen={onOpen}
-            onCompress={onCompress}
-            canCompress={canCompress}
           />
         ))}
       </div>

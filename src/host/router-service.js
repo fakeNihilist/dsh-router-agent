@@ -32,9 +32,21 @@ const PROJECT_OPS = new Set([
   'untracked',
   'history',
   'onboarding',
+  'manual',
+  'retry',
+  'retarget',
+  'cancelTask',
 ]);
 
+const AUTO_ASK_VALUES = new Set(['keep', 'suggest', 'decide']);
+
 const low = (value) => (typeof value === 'string' ? value.toLowerCase() : '');
+
+/** This Host's auto-mode policy for an RA `ask` proposal. */
+function autoAskPolicy(settings) {
+  const value = settings?.autoAsk;
+  return AUTO_ASK_VALUES.has(value) ? value : 'keep';
+}
 
 /**
  * Host-side Router owner.
@@ -189,7 +201,10 @@ export class RouterService {
   async listProjects(summaries = null) {
     if (!this.probe.sessionController.list) return [];
     const rows = summaries ?? (await this.reader.summaries());
-    const routerIds = await this.routerSessionIds(rows);
+    const metas = await this.projectSidecars(rows);
+    const routerIds = new Set(
+      [...metas.values()].map((meta) => meta.raSessionId).filter(Boolean),
+    );
     const byCwd = new Map();
     for (const summary of rows) {
       if (!summary.cwd) continue;
@@ -202,39 +217,55 @@ export class RouterService {
       // different counts and split one project across two selector entries.
       const key = resolve(summary.cwd).toLowerCase();
       const project = resolve(summary.cwd);
+      const meta = metas.get(key);
       const row = byCwd.get(key) ?? {
         project,
         name: basename(project) || project,
         sessions: 0,
+        tracked: 0,
         lastActiveAt: 0,
       };
+      const updatedAt = Number(summary.updatedAt) || 0;
+      const cutoff = Date.now() - (Number(meta?.trackingDays) || this.config.firstRunDays) * DAY;
+      const stopped = !!meta?.stopped?.[summary.sessionId];
+      const pinned = !!meta?.pinned?.[summary.sessionId];
       row.sessions += 1;
-      row.lastActiveAt = Math.max(row.lastActiveAt, Number(summary.updatedAt) || 0);
+      if (!stopped && (updatedAt >= cutoff || pinned)) row.tracked += 1;
+      row.lastActiveAt = Math.max(row.lastActiveAt, updatedAt);
       byCwd.set(key, row);
     }
     return [...byCwd.values()].sort((a, b) => b.lastActiveAt - a.lastActiveAt);
   }
 
   /**
-   * Read the per-project RA id from `.dsh_RA/state.json`. Cold summaries may
-   * omit `agentPreset` from their projection cache, so the sidecar is the
-   * reliable way to keep the Router session out of project counts and trees.
+   * Read the per-project sidecar facts the project list needs.
+   *
+   * Cold summaries may omit `agentPreset`, so the sidecar is the reliable way
+   * to keep the Router session out of project counts and to know each
+   * project's tracking window without collecting every project's full tree.
    */
-  async routerSessionIds(summaries) {
-    const ids = new Set();
+  async projectSidecars(summaries) {
+    const out = new Map();
     const cwds = [...new Set(summaries.map((summary) => summary.cwd).filter(Boolean))];
     for (const cwd of cwds) {
-      const cached = this.raIdCache.get(cwd);
+      const key = resolve(cwd).toLowerCase();
+      const cached = this.raIdCache.get(key);
       if (cached && Date.now() - cached.at < 5000) {
-        if (cached.id) ids.add(cached.id);
+        out.set(key, cached.meta);
         continue;
       }
       const state = await readJson(join(cwd, '.dsh_RA', 'state.json'), null);
-      const id = state?.raSessionId ?? null;
-      this.raIdCache.set(cwd, { at: Date.now(), id });
-      if (id) ids.add(id);
+      const days = Number(state?.settings?.trackingDays ?? state?.tracking?.days);
+      const meta = {
+        raSessionId: state?.raSessionId ?? null,
+        trackingDays: Number.isFinite(days) && days > 0 ? days : this.config.firstRunDays,
+        stopped: state?.stopped ?? {},
+        pinned: state?.pinned ?? {},
+      };
+      this.raIdCache.set(key, { at: Date.now(), meta });
+      out.set(key, meta);
     }
-    return ids;
+    return out;
   }
 
   /** Whether a summary belongs to the Router itself rather than the project tree. */
@@ -277,7 +308,7 @@ export class RouterService {
     const summaries = options.summaries
       ? options.summaries.filter((summary) => sameProject(summary.cwd, project))
       : await this.reader.listProject(project);
-    const cutoff = Date.now() - (Number(state.tracking.days) || this.config.firstRunDays) * DAY;
+    const cutoff = Date.now() - (Number(state.settings.trackingDays) || this.config.firstRunDays) * DAY;
     const candidates = summaries
       .filter((summary) => !this.isRouterSummary(summary, state))
       .filter((summary) => summary.origin !== 'subagent');
@@ -386,43 +417,21 @@ export class RouterService {
     }
 
     const pipeline = this.pipelineFor(project);
-    if ((state.onboarding.status === 'idle' || state.onboarding.status === 'running') && rows.length > 0) {
-      const indexKey = resolve(project).toLowerCase();
-      if (!this.indexing.has(indexKey)) {
-        this.indexing.add(indexKey);
-        await store.onboarding({
-          status: 'running',
-          total: rows.length,
-          done: 0,
-          startedAt: state.onboarding.startedAt ?? new Date().toISOString(),
-          completedAt: null,
-          current: null,
-          failed: [],
-        });
-        pipeline
-          .indexRows(rows, { onboarding: true })
-          .catch(async (error) => {
-            // A failure outside one row's build (progress/state write, queue
-            // failure) must not leave the overlay spinning forever.
-            await store
-              .onboarding({
-                status: 'failed',
-                current: null,
-                completedAt: new Date().toISOString(),
-                failed: [{ sessionId: null, message: String(error?.message ?? error) }],
-              })
-              .catch(() => {});
-          })
-          .finally(() => this.indexing.delete(indexKey));
-      }
-    } else if (state.onboarding.status === 'complete' && dirty.length > 0) {
+    if (state.onboarding.status === 'complete' && dirty.length > 0) {
+      // Incremental maintenance after the user has confirmed the first index.
       pipeline.schedule(dirty);
-    }
-
-    const seenChanged = rows.some((row) => state.lastSeen[row.sessionId] !== row.lastActiveAt);
-    if (seenChanged) {
-      await store.touchSeen(rows.map((row) => ({ sessionId: row.sessionId, updatedAt: row.lastActiveAt })));
-      for (const row of rows) state.lastSeen[row.sessionId] = row.lastActiveAt;
+    } else if (state.onboarding.status === 'running') {
+      // The user already confirmed this index; a Host restart resumes it.
+      this.startIndexing(project, rows);
+    } else if (state.onboarding.status !== 'complete') {
+      // Awaiting confirmation / skipped / failed: keep the confirmation card's
+      // counts current, but never start model calls on the user's behalf.
+      const done = Math.max(0, rows.length - dirty.length);
+      if (state.onboarding.total !== rows.length || state.onboarding.done !== done) {
+        await store.onboarding({ total: rows.length, done });
+        state.onboarding.total = rows.length;
+        state.onboarding.done = done;
+      }
     }
 
     if (Date.now() - this.lastPrunedAt > PROJECT_PRUNE_INTERVAL) {
@@ -436,36 +445,6 @@ export class RouterService {
 
     const latest = store.state ?? state;
     return { store, state: latest, rows, untracked, roots: forest.roots.map((row) => row.sessionId), edges, dirty, readErrors };
-  }
-
-  async raMessages(state) {
-    if (!state.raSessionId) return [];
-    try {
-      const live = this.ctx.sessions.get(state.raSessionId);
-      const record = await this.reader.read(state.raSessionId, Number(live?.seq) || 0);
-      const out = [];
-      for (const event of record.events) {
-        if (event.type === 'user/message' && event.data?.source?.kind === 'user') {
-          let text = messageText(event.data);
-          // The Host wraps the task with project/settings for the RA; the
-          // conversation view shows the user's task (or the answer), not the
-          // envelope. The envelope is also the durable task source for a
-          // queued answer, so display it without the transport lines.
-          const envelope = parseTaskEnvelope(text);
-          if (envelope) {
-            const answer = /用户回答：([\s\S]*?)(?:\n请据此|$)/.exec(text);
-            text = answer ? `回答：${answer[1].trim()}` : envelope.task;
-          }
-          if (text.trim()) out.push({ role: 'user', text, at: event.time });
-        } else if (event.type === 'assistant/message') {
-          const text = messageText(event.data?.message);
-          if (text.trim()) out.push({ role: 'assistant', text, at: event.time });
-        }
-      }
-      return out.slice(-24);
-    } catch {
-      return [];
-    }
   }
 
   /**
@@ -601,7 +580,6 @@ export class RouterService {
       ra: {
         sessionId: state.raSessionId,
         running: await this.raRunning(state),
-        messages: await this.raMessages(state),
         task: this.activeTask(selected.project),
       },
       pending,
@@ -718,8 +696,8 @@ export class RouterService {
     const store = this.storeFor(project);
     const collected = await this.collect(project);
     const state = collected.state;
-    if (collected.rows.length > 0 && state.onboarding.status !== 'complete') {
-      throw new HttpError(409, 'onboarding-running', '首次接入的会话索引尚未完成，完成后才能路由。');
+    if (collected.rows.length > 0 && state.onboarding.status === 'running') {
+      throw new HttpError(409, 'onboarding-running', '首次接入的会话索引正在建立，完成后才能继续路由。');
     }
     const ra = await this.ensureRA(store.project);
     const nextComposer = {
@@ -736,11 +714,22 @@ export class RouterService {
       raSessionId: ra.sessionId,
     });
     await store.setSettings({ composer: nextComposer });
+    const policy = autoAskPolicy(state.settings);
+    const autoLines =
+      nextComposer.auto && policy === 'decide'
+        ? ['自动执行已开启：不要使用 ask，请直接在 route / fork / new 中选择一个。']
+        : nextComposer.auto && policy === 'suggest'
+          ? [
+              '自动执行已开启：如确实需要追问，必须提供 options；Host 会自动采用第一个建议项继续判断，其余动作直接执行。',
+            ]
+          : nextComposer.auto
+            ? ['自动执行已开启：可以追问（ask），但追问仍需要用户回答；其余动作会直接执行。']
+            : [];
     const wrapper = [
       `项目：${store.project}`,
       `用户任务：${text}`,
       composerLine(nextComposer),
-      ...(nextComposer.auto ? ['自动执行已开启：不要使用 ask，请直接在 route / fork / new 中选择一个。'] : []),
+      ...autoLines,
       '',
       '请先用 ra_tree 查看会话；需要时用 ra_brief 看候选会话的分叉边界；然后用 ra_propose 提交恰好一个提议。不要直接回答任务内容。',
     ].join('\n');
@@ -828,6 +817,7 @@ export class RouterService {
     if (!project) throw new Error('Router Agent has no project cwd.');
     const store = this.storeFor(project);
     const state = await store.read();
+    const policy = autoAskPolicy(state.settings);
     const active = this.activeTask(project);
     const latest = await this.latestTaskContext(agent);
     const envelope = latest.envelope;
@@ -848,8 +838,8 @@ export class RouterService {
       envelope?.composer ??
       (latest.found ? state.settings.composer : active?.composer) ??
       state.settings.composer;
-    if (action === 'ask' && composer.auto) {
-      throw new Error('自动执行已开启：不能追问，请直接在 route / fork / new 中选择一个并提交提议。');
+    if (action === 'ask' && composer.auto && policy === 'decide') {
+      throw new Error('自动执行已开启且设置为“交给 RA 判断”：不能追问，请直接在 route / fork / new 中选择一个并提交提议。');
     }
     const token = randomUUID();
     const now = Date.now();
@@ -903,6 +893,49 @@ export class RouterService {
       raSessionId: agent?.id ?? active?.raSessionId ?? state.raSessionId,
       summary: this.proposalSummary({ action, target, atSeq, turn, title: args?.title, question: args?.question }),
     };
+
+    // Auto mode + “use the suggestion”: answer the RA's question with its own
+    // first option and let the next turn produce the real routing proposal.
+    if (action === 'ask' && composer.auto && policy === 'suggest' && proposal.options.length > 0) {
+      const answer = proposal.options[0];
+      await store.saveProposal({
+        ...proposal,
+        status: 'answered',
+        auto: true,
+        answer,
+        answeredAt: now,
+      });
+      try {
+        await this.sendFollowUp(project, {
+          task: proposal.task,
+          composer,
+          raSessionId: proposal.raSessionId,
+          line: `Host 按“自动使用建议项”采用：${answer}`,
+        });
+      } catch (error) {
+        await store
+          .saveProposal({
+            ...proposal,
+            status: 'failed',
+            auto: true,
+            answer,
+            error: String(error?.message ?? error),
+          })
+          .catch(() => {});
+        await this.recordHistory(store, proposal, { result: 'failed' }, 'auto', error);
+        throw error;
+      }
+      await this.recordHistory(store, proposal, { result: 'asked' }, 'auto');
+      return {
+        token,
+        action,
+        summary: proposal.summary,
+        confirmRequired: false,
+        executed: true,
+        autoAnswered: true,
+        answer,
+      };
+    }
 
     if (!proposal.auto) {
       await store.saveProposal(proposal);
@@ -972,7 +1005,14 @@ export class RouterService {
         atSeq: proposal.atSeq,
         turn: proposal.turn,
         reason: redactSecrets(proposal.reason),
-        result: result?.result === 'failed' ? 'failed' : mode === 'auto' ? 'auto' : result?.result ?? 'sent',
+        result:
+          result?.result === 'failed'
+            ? 'failed'
+            : result?.result === 'asked'
+              ? 'asked'
+              : mode === 'auto'
+                ? 'auto'
+                : result?.result ?? 'sent',
         mode,
         composer: proposal.composer,
         error: error ? String(error?.message ?? error) : null,
@@ -1000,6 +1040,8 @@ export class RouterService {
         return { ok: true, at: new Date().toISOString() };
       case 'ask':
         return this.ask(body);
+      case 'manual':
+        return this.manual(body);
       case 'confirm':
         return this.confirm(body);
       case 'choose':
@@ -1008,6 +1050,12 @@ export class RouterService {
         return this.abandon(body);
       case 'answer':
         return this.answerAsk(body);
+      case 'retry':
+        return this.retry(body);
+      case 'retarget':
+        return this.retarget(body);
+      case 'cancelTask':
+        return this.cancelTask(body);
       case 'detail':
         return this.detail(body);
       case 'compress':
@@ -1025,7 +1073,7 @@ export class RouterService {
       case 'history':
         return this.history(body);
       case 'onboarding':
-        return this.onboardingRetry(body);
+        return this.onboardingOp(body);
       case 'debug':
         if (!this.config.dev) throw new HttpError(404, 'unknown-op', 'Unknown Router operation.');
         return this.debug();
@@ -1144,7 +1192,7 @@ export class RouterService {
       .mutateProposal(token, (entry) => ({ ...entry, status: 'confirmed', result, executedAt: Date.now() }))
       .catch(() => {});
     await this.recordHistory(store, claimed, result, 'confirm');
-    this.clearActiveTask(claimed.project, claimed.task, claimed.raSessionId);
+    if (!claimed.manual) this.clearActiveTask(claimed.project, claimed.task, claimed.raSessionId);
     return { ok: true, result };
   }
 
@@ -1202,9 +1250,48 @@ export class RouterService {
           composer: updated.composer,
         })
         .catch(() => {});
-      this.clearActiveTask(updated.project, updated.task, updated.raSessionId);
+      if (!updated.manual) this.clearActiveTask(updated.project, updated.task, updated.raSessionId);
     }
     return { ok: true };
+  }
+
+  /**
+   * Queue one follow-up turn on the RA session (an answer, an auto-selected
+   * suggestion, or a “judge again” request) while keeping the original task in
+   * the envelope so a newer queued task cannot silently replace it.
+   */
+  async sendFollowUp(project, { task, composer, line }) {
+    const store = this.storeFor(project);
+    const state = await store.read();
+    const ra = await this.ensureRA(store.project);
+    const current = this.activeTask(store.project);
+    const effectiveTask = String(task ?? current?.task ?? '').trim() || '（沿用当前任务）';
+    const effectiveComposer = composer ?? current?.composer ?? state.settings.composer;
+    const prompt = [
+      `项目：${store.project}`,
+      `用户任务：${effectiveTask}`,
+      composerLine(effectiveComposer),
+      line,
+      '',
+      '请据此继续判断，并用 ra_propose 提交恰好一个提议。',
+    ].join('\n');
+    await this.ctx.sessionController.prompt(
+      {
+        requestId: randomUUID(),
+        sessionId: ra.sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text: prompt }],
+        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      },
+      new AbortController().signal,
+    );
+    this.activeTasks.set(this.taskKey(store.project), {
+      task: effectiveTask,
+      composer: effectiveComposer,
+      at: Date.now(),
+      raSessionId: ra.sessionId,
+    });
+    return ra;
   }
 
   /** Answer an `ask` proposal by feeding the answer back to the RA. */
@@ -1285,6 +1372,175 @@ export class RouterService {
       })
       .catch(() => {});
     return { ok: true, raSessionId: ra.sessionId };
+  }
+
+  /**
+   * Manual dispatch fallback: the user picked the target and action on the
+   * canvas, bypassing the RA. It still writes a normal pending proposal so the
+   * same confirmation and lastSeq guard apply, and it never auto-executes.
+   */
+  async manual({ project, task, action, targetSessionId, atSeq, composer }) {
+    const text = String(task ?? '').trim();
+    if (!text) throw new HttpError(400, 'empty-task', '任务不能为空。');
+    if (!['route', 'fork', 'new'].includes(action)) {
+      throw new HttpError(400, 'bad-action', '手动派发只支持 route、fork 或 new。');
+    }
+    const store = this.storeFor(project);
+    const state = await store.read();
+    const nextComposer = {
+      mode: composer?.mode === 'plan' ? 'plan' : 'standard',
+      permissions: ['read-only', 'workspace-write', 'danger-full-access'].includes(composer?.permissions)
+        ? composer.permissions
+        : state.settings.composer.permissions,
+      auto: false,
+    };
+    const token = randomUUID();
+    const now = Date.now();
+    let target = null;
+    let boundary = null;
+    if (action === 'route' || action === 'fork') {
+      const found = await this.findRow(project, targetSessionId);
+      target = found.row;
+      if (action === 'fork') {
+        boundary = atSeq
+          ? target.boundaries.find((item) => Number(item.atSeq) === Number(atSeq))
+          : target.boundaries.at(-1);
+        if (!boundary) {
+          throw new HttpError(400, 'no-boundary', '该会话还没有可作为分叉点的已完成轮次。');
+        }
+      }
+    }
+    const proposal = {
+      token,
+      project,
+      action,
+      task: text,
+      targetSessionId: target?.sessionId ?? null,
+      targetTitle: target?.title ?? null,
+      targetLastSeq: target?.lastSeq ?? null,
+      targetPlan: target?.plan?.active ?? null,
+      targetPermissions: target?.permissions ?? null,
+      atSeq: boundary?.atSeq ?? null,
+      turn: boundary?.turn ?? null,
+      title: null,
+      question: null,
+      options: [],
+      reason: '手动派发：由用户在画布上指定目标。',
+      composer: nextComposer,
+      auto: false,
+      manual: true,
+      status: 'pending',
+      createdAt: now,
+      expiresAt: now + (Number(this.config.proposalTtlMs) || 600000),
+      raSessionId: state.raSessionId,
+      summary: this.proposalSummary({
+        action,
+        target,
+        atSeq: boundary?.atSeq,
+        turn: boundary?.turn,
+      }),
+    };
+    await store.saveProposal(proposal);
+    return { ok: true, token, summary: proposal.summary };
+  }
+
+  /** Abandon a pending proposal and ask the RA to judge the same task again. */
+  async retry({ project, token, note }) {
+    const store = this.storeFor(project);
+    const proposal = await store.getProposal(token);
+    if (!proposal) throw new HttpError(404, 'proposal-not-found', '提议不存在或已过期。');
+    if (!sameProject(proposal.project, store.project)) {
+      throw new HttpError(409, 'proposal-project-mismatch', '提议不属于该项目。');
+    }
+    if (proposal.status !== 'pending') throw new HttpError(409, 'proposal-not-pending', '该提议已处理。');
+    const updated = await store.mutateProposal(token, (current) =>
+      current.status === 'pending'
+        ? { ...current, status: 'abandoned', executedAt: Date.now(), revisedAt: Date.now() }
+        : null,
+    );
+    if (!updated) throw new HttpError(409, 'proposal-not-pending', '该提议已处理。');
+    const correction = String(note ?? '').trim().slice(0, 500);
+    try {
+      await this.sendFollowUp(project, {
+        task: updated.task,
+        composer: updated.composer,
+        line: correction
+          ? `用户要求重新判断：${correction}`
+          : '用户要求重新判断，请重新考虑目标或动作。',
+      });
+    } catch (error) {
+      await store
+        .mutateProposal(token, (current) =>
+          current.status === 'abandoned'
+            ? { ...current, status: 'pending', executedAt: undefined, revisedAt: undefined }
+            : null,
+        )
+        .catch(() => {});
+      throw error;
+    }
+    await this.recordHistory(store, updated, { result: 'revised' }, 'manual');
+    return { ok: true };
+  }
+
+  /** Change a pending route/fork proposal's target without re-asking the RA. */
+  async retarget({ project, token, sessionId }) {
+    const store = this.storeFor(project);
+    const proposal = await store.getProposal(token);
+    if (!proposal) throw new HttpError(404, 'proposal-not-found', '提议不存在或已过期。');
+    if (!sameProject(proposal.project, store.project)) {
+      throw new HttpError(409, 'proposal-project-mismatch', '提议不属于该项目。');
+    }
+    if (proposal.status !== 'pending') throw new HttpError(409, 'proposal-not-pending', '该提议已处理。');
+    if (proposal.action !== 'route' && proposal.action !== 'fork') {
+      throw new HttpError(400, 'not-retargetable', '只有继续或分叉提议可以更换目标。');
+    }
+    const { row } = await this.findRow(project, sessionId);
+    const boundary = proposal.action === 'fork' ? row.boundaries.at(-1) : null;
+    if (proposal.action === 'fork' && !boundary) {
+      throw new HttpError(400, 'no-boundary', '该会话还没有可作为分叉点的已完成轮次。');
+    }
+    const updated = await store.mutateProposal(token, (current) => {
+      if (current.status !== 'pending') return null;
+      return {
+        ...current,
+        targetSessionId: row.sessionId,
+        targetTitle: row.title,
+        targetLastSeq: row.lastSeq,
+        targetPlan: row.plan?.active ?? null,
+        targetPermissions: row.permissions ?? null,
+        atSeq: boundary?.atSeq ?? null,
+        turn: boundary?.turn ?? null,
+        summary: this.proposalSummary({
+          action: current.action,
+          target: row,
+          atSeq: boundary?.atSeq,
+          turn: boundary?.turn,
+        }),
+      };
+    });
+    if (!updated) throw new HttpError(409, 'proposal-not-pending', '该提议已处理。');
+    return { ok: true, proposal: updated };
+  }
+
+  /** Stop waiting for the RA and drop queued prompts for the active task. */
+  async cancelTask({ project }) {
+    const store = this.storeFor(project);
+    const state = await store.read();
+    const active = this.activeTask(project);
+    this.activeTasks.delete(this.taskKey(project));
+    let canceled = false;
+    if (state.raSessionId) {
+      const agent = this.ctx.agents.get(state.raSessionId);
+      if (agent && agent.status === 'running' && typeof agent.cancel === 'function') {
+        try {
+          agent.cancel({ kind: 'user' });
+          canceled = true;
+        } catch (error) {
+          this.ctx.logger?.warn?.('[dsh-router-agent] RA cancel failed: %o', error);
+        }
+      }
+    }
+    return { ok: true, canceled, hadTask: !!active };
   }
 
   async currentLastSeq(sessionId) {
@@ -1534,7 +1790,13 @@ export class RouterService {
     // reset the layout, and an explicit null must be able to clear a model.
     if (has('layout')) patch.layout = settings.layout === 'horizontal' ? 'horizontal' : 'vertical';
     if (has('raModel')) patch.raModel = validModel(settings.raModel);
+    if (has('indexModel')) patch.indexModel = validModel(settings.indexModel);
     if (has('defaultSessionModel')) patch.defaultSessionModel = validModel(settings.defaultSessionModel);
+    if (has('autoAsk') && AUTO_ASK_VALUES.has(settings.autoAsk)) patch.autoAsk = settings.autoAsk;
+    if (has('trackingDays')) {
+      const days = Number(settings.trackingDays);
+      if (Number.isFinite(days) && days >= 1 && days <= 365) patch.trackingDays = Math.round(days);
+    }
     if (settings?.composer) {
       patch.composer = {
         ...state.settings.composer,
@@ -1549,6 +1811,14 @@ export class RouterService {
       };
     }
     const saved = await store.setSettings(patch);
+    if (has('trackingDays') && saved.settings.trackingDays) {
+      // Keep the legacy field in sync for older readers, and drop the project
+      // list cache so the new window is visible on the next poll.
+      await store.update((state) => {
+        state.tracking.days = saved.settings.trackingDays;
+      });
+      this.raIdCache.delete(resolve(project).toLowerCase());
+    }
     if (has('raModel') && state.raSessionId) {
       const agent = this.ctx.agents.get(state.raSessionId);
       if (agent) {
@@ -1587,20 +1857,96 @@ export class RouterService {
     return { ok: true, title: clean };
   }
 
-  async onboardingRetry({ project }) {
+  /**
+   * Start the onboarding queue once per project. The caller has already
+   * decided that indexing is allowed (user confirmation, or a persisted
+   * `running` state that is being resumed after a Host restart).
+   */
+  startIndexing(project, rows) {
+    const indexKey = resolve(project).toLowerCase();
+    if (this.indexing.has(indexKey) || rows.length === 0) return false;
+    this.indexing.add(indexKey);
     const store = this.storeFor(project);
+    this.pipelineFor(project)
+      .indexRows(rows, { onboarding: true })
+      .catch(async (error) => {
+        // A failure outside one row's build (progress/state write, queue
+        // failure) must not leave the overlay spinning forever.
+        await store
+          .onboarding({
+            status: 'failed',
+            current: null,
+            completedAt: new Date().toISOString(),
+            failed: [{ sessionId: null, message: String(error?.message ?? error) }],
+          })
+          .catch(() => {});
+      })
+      .finally(() => this.indexing.delete(indexKey));
+    return true;
+  }
+
+  /**
+   * User-confirmed first index.
+   *
+   * `collect()` deliberately never starts model calls on an untouched project.
+   * The panel shows the confirmation card, and this operation is the place
+   * that flips the onboarding state to `running`. `action: 'skip'` remembers
+   * “later”; the project stays browsable and routable with titles/extractive
+   * briefs.
+   */
+  async onboardingOp({ project, action }) {
+    const store = this.storeFor(project);
+    const state = await store.read();
+    if (action === 'reset') {
+      // Dev-only: let the acceptance suite put a project back into the
+      // pre-confirmation state without re-seeding the whole profile.
+      if (!this.config.dev) throw new HttpError(404, 'unknown-action', 'Unknown onboarding action.');
+      await store.onboarding({
+        status: 'awaiting',
+        current: null,
+        startedAt: null,
+        completedAt: null,
+        failed: [],
+      });
+      return this.state({ project });
+    }
+    if (action === 'skip') {
+      const { rows } = await this.collect(project);
+      await store.onboarding({
+        status: 'skipped',
+        total: rows.length,
+        done: state.onboarding.done ?? 0,
+        current: null,
+        completedAt: null,
+      });
+      return this.state({ project });
+    }
+    const { rows } = await this.collect(project);
+    if (rows.length === 0) {
+      await store.onboarding({
+        status: 'complete',
+        total: 0,
+        done: 0,
+        current: null,
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        failed: [],
+      });
+      return { ok: true, total: 0 };
+    }
     await store.onboarding({
-      status: 'idle',
-      total: 0,
-      done: 0,
+      status: 'running',
+      total: rows.length,
+      done: state.onboarding.done ?? 0,
+      startedAt:
+        action === 'retry' || !state.onboarding.startedAt
+          ? new Date().toISOString()
+          : state.onboarding.startedAt,
+      completedAt: null,
       current: null,
       failed: [],
-      startedAt: null,
-      completedAt: null,
     });
-    // collect() starts (or resumes) the queue under its per-project guard, so a
-    // retry cannot race the normal first-run path.
-    const { rows } = await this.collect(project);
+    this.startIndexing(project, rows);
     return { ok: true, total: rows.length };
   }
 

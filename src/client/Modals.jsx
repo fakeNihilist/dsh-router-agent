@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { CloseIcon, HistoryIcon, SettingsIcon } from './icons.jsx';
+import { CloseIcon } from './icons.jsx';
 import { Select } from './Select.jsx';
 
 function tokens(value) {
@@ -34,10 +34,14 @@ function Head({ title, onClose }) {
 export function SettingsModal({ settings, models, onSave, onClose }) {
   const [layout, setLayout] = useState(settings?.layout ?? 'vertical');
   const savedRa = modelValue(settings?.raModel);
+  const savedIndex = modelValue(settings?.indexModel);
   const savedFresh = modelValue(settings?.defaultSessionModel);
   const fallbackModel = defaultModelValue(models);
   const [ra, setRa] = useState(() => savedRa || fallbackModel);
+  const [index, setIndex] = useState(() => savedIndex || fallbackModel);
   const [fresh, setFresh] = useState(() => savedFresh || fallbackModel);
+  const [autoAsk, setAutoAsk] = useState(settings?.autoAsk ?? 'keep');
+  const [trackingDays, setTrackingDays] = useState(String(settings?.trackingDays ?? 7));
   const [busy, setBusy] = useState(false);
   const groups = models?.groups ?? [];
   // The dropdown no longer offers a "deployment default" row. When the user
@@ -51,7 +55,10 @@ export function SettingsModal({ settings, models, onSave, onClose }) {
       await onSave({
         layout,
         raModel: modelForSave(ra, savedRa),
+        indexModel: modelForSave(index, savedIndex),
         defaultSessionModel: modelForSave(fresh, savedFresh),
+        autoAsk,
+        trackingDays: Number(trackingDays),
       });
       onClose?.();
     } catch {
@@ -79,7 +86,7 @@ export function SettingsModal({ settings, models, onSave, onClose }) {
           />
         </div>
         <div className="dra-field">
-          <label htmlFor="dra-ra-model">RA 模型</label>
+          <label htmlFor="dra-ra-model">Router 模型（对话）</label>
           <Select
             id="dra-ra-model"
             value={ra}
@@ -87,10 +94,26 @@ export function SettingsModal({ settings, models, onSave, onClose }) {
             groups={modelGroups(groups)}
             disabled={groups.length === 0}
             placeholder="选择模型"
-            ariaLabel="RA 模型"
+            ariaLabel="Router 模型"
             menuMinWidth={260}
           />
-          <div className="dra-field-help">只影响 Router 会话，不改变整个部署的默认模型。</div>
+          <div className="dra-field-help">只用于 Router 的对话与路由判断，不改变目标会话的模型。</div>
+        </div>
+        <div className="dra-field">
+          <label htmlFor="dra-index-model">索引模型</label>
+          <Select
+            id="dra-index-model"
+            value={index}
+            onChange={setIndex}
+            groups={modelGroups(groups)}
+            disabled={groups.length === 0}
+            placeholder="选择模型"
+            ariaLabel="索引模型"
+            menuMinWidth={260}
+          />
+          <div className="dra-field-help">
+            用于首次建立索引和后台摘要刷新；默认跟随部署默认模型。选择更强的模型会更准，也更贵。
+          </div>
         </div>
         <div className="dra-field">
           <label htmlFor="dra-new-model">新会话默认模型</label>
@@ -104,7 +127,44 @@ export function SettingsModal({ settings, models, onSave, onClose }) {
             ariaLabel="新会话默认模型"
             menuMinWidth={260}
           />
-          <div className="dra-field-help">只用于 Router 新建的会话；已有会话保持原模型。</div>
+          <div className="dra-field-help">用于 Router 新建和分叉的会话；已有会话保持原模型。</div>
+        </div>
+        <div className="dra-field">
+          <label htmlFor="dra-auto-ask">自动执行遇到追问时</label>
+          <Select
+            id="dra-auto-ask"
+            value={autoAsk}
+            onChange={setAutoAsk}
+            options={[
+              { value: 'keep', label: '保留追问 · 等用户回答' },
+              { value: 'suggest', label: '自动采用第一个建议项' },
+              { value: 'decide', label: '交给 RA 判断 · 不允许追问' },
+            ]}
+            ariaLabel="自动执行遇到追问时"
+            menuMinWidth={240}
+          />
+          <div className="dra-field-help">
+            仅在输入区开启“自动执行”时生效；关闭自动执行时始终保留追问。
+          </div>
+        </div>
+        <div className="dra-field">
+          <label htmlFor="dra-tracking-days">跟踪范围</label>
+          <Select
+            id="dra-tracking-days"
+            value={trackingDays}
+            onChange={setTrackingDays}
+            options={[
+              { value: '3', label: '最近 3 天' },
+              { value: '7', label: '最近 7 天' },
+              { value: '14', label: '最近 14 天' },
+              { value: '30', label: '最近 30 天' },
+              { value: '90', label: '最近 90 天' },
+            ]}
+            ariaLabel="跟踪范围"
+          />
+          <div className="dra-field-help">
+            只跟踪这个范围内有活动的会话；手动恢复或固定的会话始终保留。修改范围不会删除已有索引。
+          </div>
         </div>
         {groups.length === 0 ? <div className="dra-error">没有可用的模型目录，模型设置暂时不可用。</div> : null}
       </div>
@@ -119,57 +179,30 @@ export function SettingsModal({ settings, models, onSave, onClose }) {
   );
 }
 
-export function HistoryModal({ ra, history, onClose, onRefresh }) {
-  const [tab, setTab] = useState('dispatch');
-  const [busy, setBusy] = useState(false);
-  const refresh = async () => {
-    setBusy(true);
-    try {
-      await onRefresh?.();
-    } finally {
-      setBusy(false);
-    }
-  };
+export function HistoryModal({ ra, history, onOpenRA, onClose }) {
+  const rows = history ?? [];
   return (
     <Mask onClose={onClose} label="Router 历史">
-      <Head title="Router 历史" onClose={onClose} />
+      <Head title="派发记录" onClose={onClose} />
       <div className="dra-modal-body">
         <div className="dra-detail-row" style={{ marginTop: 0 }}>
           <button
-            className={`dra-btn dra-btn-sm ${tab === 'dispatch' ? 'dra-btn-primary' : ''}`}
+            className="dra-btn dra-btn-sm"
             type="button"
-            onClick={() => setTab('dispatch')}
+            disabled={!ra?.sessionId}
+            onClick={() => onOpenRA?.(ra.sessionId)}
+            title={ra?.sessionId ? '在 DSH 中打开 Router 会话' : '还没有 Router 会话'}
           >
-            <HistoryIcon width={12} height={12} />
-            派发记录
-          </button>
-          <button
-            className={`dra-btn dra-btn-sm ${tab === 'ra' ? 'dra-btn-primary' : ''}`}
-            type="button"
-            onClick={() => setTab('ra')}
-          >
-            与 RA 的对话
+            打开 RA 会话
           </button>
           <span className="dra-spacer" />
-          <button className="dra-btn dra-btn-sm" type="button" disabled={busy} onClick={refresh}>刷新</button>
+          <span className="dra-field-help">只记录 Router 确认或自动执行的派发。</span>
         </div>
-        {tab === 'ra' ? (
-          <div style={{ marginTop: 10 }}>
-            {(ra?.messages ?? []).length === 0 ? (
-              <div className="dra-field-help">还没有与 RA 的对话。发送一个任务后会显示在这里。</div>
-            ) : (
-              (ra.messages ?? []).map((message, index) => (
-                <div className="dra-msg" data-role={message.role} key={`${message.at}-${index}`}>
-                  {message.text}
-                </div>
-              ))
-            )}
-          </div>
-        ) : (history ?? []).length === 0 ? (
+        {rows.length === 0 ? (
           <div className="dra-field-help" style={{ marginTop: 10 }}>还没有派发记录。</div>
         ) : (
           <div className="dra-list" style={{ marginTop: 10 }}>
-            {history.map((row) => (
+            {rows.map((row) => (
               <div className="dra-list-row" key={row.id}>
                 <div className="dra-grow">
                   <div className="dra-list-title">{row.task}</div>
@@ -355,20 +388,66 @@ export function StopModal({ session, onConfirm, onClose }) {
   );
 }
 
-export function OnboardingOverlay({ onboarding, currentTitle, onRetry }) {
-  if (!onboarding || onboarding.total === 0 || onboarding.status === 'complete') return null;
+export function OnboardingOverlay({
+  onboarding,
+  currentTitle,
+  trackingDays = 7,
+  onStart,
+  onSkip,
+}) {
+  const [busy, setBusy] = useState(false);
+  if (!onboarding || onboarding.total === 0) return null;
+  const start = async () => {
+    setBusy(true);
+    try {
+      await onStart?.();
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (onboarding.status === 'awaiting') {
+    return (
+      <div className="dra-modal-mask" style={{ background: 'color-mix(in srgb, #000 26%, transparent)' }}>
+        <div className="dra-modal" style={{ width: 'min(460px, 100%)' }}>
+          <div className="dra-modal-head">
+            <span>首次接入：建立会话索引</span>
+          </div>
+          <div className="dra-modal-body">
+            <div className="dra-field-help">
+              将索引最近 {trackingDays} 天有活动的 {onboarding.total} 个会话
+              {onboarding.done > 0 ? `（其中 ${onboarding.done} 个已有可用索引）` : ''}。
+              索引会按“索引模型”调用模型，之后新增或更新的会话会自动刷新。
+            </div>
+            <div className="dra-field-help" style={{ marginTop: 8 }}>
+              现在先路由也可以，但 Router 只能先看标题；建立索引后判断会更准。
+            </div>
+          </div>
+          <div className="dra-modal-foot">
+            <button className="dra-btn" type="button" disabled={busy} onClick={() => onSkip?.()}>
+              稍后
+            </button>
+            <span className="dra-spacer" />
+            <button className="dra-btn dra-btn-primary" type="button" disabled={busy} onClick={start}>
+              {busy ? '启动中…' : '开始索引'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (onboarding.status !== 'running') return null;
   const percent = onboarding.total ? Math.round((onboarding.done / onboarding.total) * 100) : 0;
   return (
     <div className="dra-modal-mask" style={{ background: 'color-mix(in srgb, #000 26%, transparent)' }}>
       <div className="dra-modal" style={{ width: 'min(420px, 100%)' }}>
         <div className="dra-modal-head">
-          <span>首次接入：建立会话索引</span>
+          <span>正在建立会话索引</span>
           <span className="dra-spacer" />
-          {onboarding.status === 'running' ? <span className="dra-spin" /> : null}
+          <span className="dra-spin" />
         </div>
         <div className="dra-modal-body">
           <div className="dra-field-help">
-            只索引最近 7 天有活动的会话。完成后才能开始路由；中断后可以继续。
+            索引完成后才能继续发送任务；中断后可以从提示条继续。
           </div>
           <div className="dra-progress" style={{ marginTop: 12 }}>
             <i style={{ width: `${percent}%` }} />
@@ -380,18 +459,37 @@ export function OnboardingOverlay({ onboarding, currentTitle, onRetry }) {
             </span>
             <span className="dra-spacer" />
             {onboarding.failed?.length ? (
-              <button className="dra-btn dra-btn-sm" type="button" onClick={onRetry}>
-                重试失败项
-              </button>
+              <span className="dra-field-help" style={{ color: 'var(--dra-error)' }}>
+                {onboarding.failed.length} 个失败
+              </span>
             ) : null}
           </div>
-          {onboarding.failed?.length ? (
-            <div className="dra-field-help" style={{ color: 'var(--dra-error)', marginTop: 8 }}>
-              {onboarding.failed.length} 个会话索引失败；路由仍可用，详情会退回抽取式索引。
-            </div>
-          ) : null}
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Non-blocking reminder after “later”, a failed index, or partial failures. */
+export function IndexBanner({ onboarding, onStart }) {
+  if (!onboarding || onboarding.total === 0) return null;
+  const failed = onboarding.failed?.length ?? 0;
+  const skipped = onboarding.status === 'skipped';
+  const failedRun = onboarding.status === 'failed';
+  const partial = onboarding.status === 'complete' && failed > 0;
+  if (!skipped && !failedRun && !partial) return null;
+  return (
+    <div className="dra-index-banner" role="status">
+      <span>
+        {skipped
+          ? '会话索引还没建立，Router 目前只能先看标题。'
+          : failedRun
+            ? '索引中断，尚未完成。'
+            : `${failed} 个会话索引失败，失败项会退回抽取式索引。`}
+      </span>
+      <button className="dra-btn dra-btn-sm" type="button" onClick={() => onStart?.(failedRun || partial ? 'retry' : 'start')}>
+        {skipped ? '开始索引' : '重试'}
+      </button>
     </div>
   );
 }
@@ -460,6 +558,7 @@ function resultLabel(result) {
     forked: '已分叉',
     auto: '自动执行',
     abandoned: '未执行',
+    revised: '重新判断',
     failed: '失败',
     asked: '已追问',
   }[result] ?? result;
