@@ -498,6 +498,10 @@ test('manual dispatch creates a normal pending proposal and sends after confirma
     assert.equal(proposal.status, 'pending');
     assert.equal(proposal.auto, false);
     assert.equal(proposal.manual, true);
+    await assert.rejects(
+      () => harness.service.retry({ project: harness.project, token: created.token, note: '改一下' }),
+      (error) => error.code === 'manual-proposal',
+    );
     assert.equal(
       proposal.targetLastSeq,
       (await harness.service.findRow(harness.project, 'p')).row.lastSeq,

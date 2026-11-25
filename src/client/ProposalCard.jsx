@@ -68,6 +68,7 @@ export function ProposalCard({
         <span>{proposal.summary}</span>
         <span className="dra-spacer" />
         {total > 1 ? <span className="dra-badge dra-queue-badge">{index + 1}/{total}</span> : null}
+        {proposal.manual ? <span className="dra-badge dra-queue-badge">手动</span> : null}
         {proposal.auto ? <span className="dra-badge" data-tone="warn">自动执行</span> : null}
       </div>
       {proposal.task ? (
@@ -195,7 +196,7 @@ export function ProposalCard({
                 </button>
               </>
             )}
-            {onRetry && !revising ? (
+            {onRetry && !revising && !proposal.manual ? (
               <button
                 className="dra-btn dra-btn-ghost dra-btn-sm"
                 type="button"
@@ -226,7 +227,7 @@ export function ProposalCard({
                 换目标
               </button>
             ) : null}
-            {onRetry && !revising ? (
+            {onRetry && !revising && !proposal.manual ? (
               <button
                 className="dra-btn dra-btn-ghost dra-btn-sm"
                 type="button"

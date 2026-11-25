@@ -119,7 +119,7 @@ content-type: application/json
 { "op": "retry", "project": "...", "token": "<uuid>", "note": "应该分叉，不要改父会话" }
 ```
 
-把原提议标为 `abandoned`（历史结果 `revised`），把 `任务原文 + 设置 + 用户要求重新判断：...` 发回 RA。`note` 最长 500 字，可为空。prompt 发送失败会把提议恢复为 pending。
+把原提议标为 `abandoned`（历史结果 `revised`），把 `任务原文 + 设置 + 用户要求重新判断：...` 发回 RA。`note` 最长 500 字，可为空。prompt 发送失败会把提议恢复为 pending。只适用于 RA 生成的提议；`manual: true` 的提议返回 `400 manual-proposal`。
 
 ### `retarget`
 

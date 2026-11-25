@@ -1453,6 +1453,9 @@ export class RouterService {
       throw new HttpError(409, 'proposal-project-mismatch', '提议不属于该项目。');
     }
     if (proposal.status !== 'pending') throw new HttpError(409, 'proposal-not-pending', '该提议已处理。');
+    if (proposal.manual) {
+      throw new HttpError(400, 'manual-proposal', '手动派发的提议不能交给 Router 重新判断；请取消后重新选择目标。');
+    }
     const updated = await store.mutateProposal(token, (current) =>
       current.status === 'pending'
         ? { ...current, status: 'abandoned', executedAt: Date.now(), revisedAt: Date.now() }
