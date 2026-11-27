@@ -30,6 +30,9 @@ const PROJECT_OPS = new Set([
   'settings',
   'rename',
   'untracked',
+  'allSessions',
+  'tracking',
+  'raMode',
   'history',
   'onboarding',
   'manual',
@@ -81,6 +84,7 @@ export class RouterService {
     this.blankCache = new Map();
     this.turnTimers = new Map();
     this.indexing = new Set();
+    this.workspaceRepaired = new Set();
     this.lastPrunedAt = 0;
     this.disposed = false;
   }
@@ -93,6 +97,7 @@ export class RouterService {
     this.stores.clear();
     for (const timer of this.turnTimers.values()) clearTimeout(timer);
     this.turnTimers.clear();
+    this.workspaceRepaired.clear();
   }
 
   refreshProbe() {
@@ -163,6 +168,99 @@ export class RouterService {
   pipelineFor(project) {
     this.storeFor(project);
     return this.pipelines.get(resolve(project));
+  }
+
+  /**
+   * The registered Workspace that owns this project directory.
+   *
+   * DSH's sidebar groups Sessions by Workspace membership, not by cwd, so a
+   * Session created with a bare `cwd` lands in「未分组」. Resolving the
+   * Workspace lets create/attach use the native membership path.
+   */
+  async workspaceFor(project) {
+    const registry = this.ctx.get?.('workspaceRegistry');
+    if (!registry) return null;
+    try {
+      if (typeof registry.resolveByPath === 'function') {
+        const found = await registry.resolveByPath(project);
+        if (found) return found;
+      }
+      if (typeof registry.list === 'function') {
+        const key = resolve(project).toLowerCase();
+        return (
+          registry.list().find((workspace) => resolve(workspace.path).toLowerCase() === key) ?? null
+        );
+      }
+    } catch (error) {
+      this.ctx.logger?.warn?.('[dsh-router-agent] workspace lookup failed: %o', error);
+    }
+    return null;
+  }
+
+  /** Create a Session through its Workspace when one owns the project. */
+  async createSession(project, options = {}) {
+    const workspace = await this.workspaceFor(project);
+    if (workspace?.id) {
+      return this.ctx.sessionController.create({ ...options, workspaceId: String(workspace.id) });
+    }
+    return this.ctx.sessionController.create({ ...options, cwd: project });
+  }
+
+  /**
+   * Best-effort idempotent Workspace attach for a Session created by fork or
+   * an older Router version. A grouping failure must not fail a dispatch that
+   * already happened, so it is logged and ignored.
+   */
+  async attachWorkspace(project, sessionId) {
+    const workspace = await this.workspaceFor(project);
+    if (!workspace) return null;
+    try {
+      if (!workspace.sessionIds?.includes(sessionId)) await workspace.attachSession(sessionId);
+      return workspace;
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        '[dsh-router-agent] workspace attach failed for %s: %o',
+        sessionId,
+        error,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * One-time migration for Sessions created before the workspaceId fix.
+   *
+   * Older Router versions created Router, `new`, and forked Sessions with a
+   * bare cwd, so DSH's sidebar put them in「未分组」even though their cwd is
+   * the Workspace path. Native DSH Sessions in the same directory are already
+   * members; attaching the rest on the first panel read repairs them without
+   * touching subagent/archived logs.
+   */
+  async repairWorkspaceMembers(project, summaries) {
+    const key = this.taskKey(project);
+    if (this.workspaceRepaired.has(key)) return;
+    this.workspaceRepaired.add(key);
+    const workspace = await this.workspaceFor(project);
+    if (!workspace) return;
+    const registry = this.ctx.get?.('workspaceRegistry');
+    const archived = new Set((registry?.archivedSessionIds ?? []).map(String));
+    const members = new Set((workspace.sessionIds ?? []).map(String));
+    for (const summary of summaries) {
+      if (!summary.cwd || !sameProject(summary.cwd, project)) continue;
+      if (summary.origin === 'subagent') continue;
+      if (archived.has(String(summary.sessionId))) continue;
+      if (members.has(String(summary.sessionId))) continue;
+      try {
+        await workspace.attachSession(summary.sessionId);
+        members.add(String(summary.sessionId));
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          '[dsh-router-agent] workspace repair failed for %s: %o',
+          summary.sessionId,
+          error,
+        );
+      }
+    }
   }
 
   async modelCatalog() {
@@ -308,6 +406,7 @@ export class RouterService {
     const summaries = options.summaries
       ? options.summaries.filter((summary) => sameProject(summary.cwd, project))
       : await this.reader.listProject(project);
+    await this.repairWorkspaceMembers(project, summaries).catch(() => {});
     const cutoff = Date.now() - (Number(state.settings.trackingDays) || this.config.firstRunDays) * DAY;
     const candidates = summaries
       .filter((summary) => !this.isRouterSummary(summary, state))
@@ -387,6 +486,24 @@ export class RouterService {
       .filter((row) => parentOf[row.sessionId])
       .map((row) => ({ from: parentOf[row.sessionId], to: row.sessionId }));
 
+    // The tracking dialog lists every real Session in the project, tracked or
+    // not, with `tracked` driving the checkbox. Inferred cutoff membership and
+    // a manual pin both count as tracked; `reason` explains an unchecked row.
+    const allSessions = [
+      ...rows.map((row) => ({
+        sessionId: row.sessionId,
+        title: row.title,
+        lastActiveAt: row.lastActiveAt,
+        lastActiveLabel: SessionReader.label(row.lastActiveAt),
+        tracked: true,
+        reason: null,
+        parentSessionId: row.parentSessionId,
+        running: row.running,
+        turns: row.turns,
+      })),
+      ...untracked.map((item) => ({ ...item, tracked: false })),
+    ].sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+
     const dirty = [];
     const summaryPatch = {};
     for (const row of rows) {
@@ -444,7 +561,7 @@ export class RouterService {
     }
 
     const latest = store.state ?? state;
-    return { store, state: latest, rows, untracked, roots: forest.roots.map((row) => row.sessionId), edges, dirty, readErrors };
+    return { store, state: latest, rows, untracked, allSessions, roots: forest.roots.map((row) => row.sessionId), edges, dirty, readErrors };
   }
 
   /**
@@ -535,6 +652,7 @@ export class RouterService {
         selectedProject: null,
         tree: { project: null, sessions: [], roots: [], edges: [], trackedCount: 0, untrackedCount: 0, readErrors: [] },
         untracked: [],
+        allSessions: [],
         settings: null,
         models: null,
         onboarding: null,
@@ -543,7 +661,7 @@ export class RouterService {
         history: [],
       };
     }
-    const { store, state, rows, untracked, roots, edges, readErrors } = await this.collect(selected.project, { summaries });
+    const { store, state, rows, untracked, allSessions, roots, edges, readErrors } = await this.collect(selected.project, { summaries });
     const settings = state.settings;
     const models = await this.modelCatalog();
     const pending = await this.pendingFor(store);
@@ -565,6 +683,7 @@ export class RouterService {
         readErrors,
       },
       untracked,
+      allSessions,
       settings,
       models: models
         ? {
@@ -627,7 +746,12 @@ export class RouterService {
     const existing = state.raSessionId;
     if (existing) {
       const live = this.ctx.agents.get(existing);
-      if (live) return { agent: live, sessionId: existing, created: false };
+      if (live) {
+        // Older Router sessions were created with a bare cwd and sit in
+        //「未分组」; attach is idempotent, so repairing it here is safe.
+        await this.attachWorkspace(project, existing);
+        return { agent: live, sessionId: existing, created: false };
+      }
       let found;
       try {
         found = await this.ctx.sessionController.resolveAgent(existing);
@@ -640,6 +764,7 @@ export class RouterService {
       }
       if (found && !('error' in found)) {
         await this.applyRAModel(found.agent, state);
+        await this.attachWorkspace(project, existing);
         return { agent: found.agent, sessionId: existing, created: false };
       }
       const code = found?.error?.code;
@@ -653,8 +778,7 @@ export class RouterService {
         throw new HttpError(503, 'ra-unavailable', `Router 会话暂时不可用：${found?.error?.message ?? code ?? 'unknown'}`);
       }
     }
-    const created = await this.ctx.sessionController.create({
-      cwd: project,
+    const created = await this.createSession(project, {
       agentPreset: 'router',
     });
     const sessionId = created.sessionId;
@@ -1070,6 +1194,12 @@ export class RouterService {
         return this.rename(body);
       case 'untracked':
         return this.untracked(body);
+      case 'allSessions':
+        return this.allSessions(body);
+      case 'tracking':
+        return this.tracking(body);
+      case 'raMode':
+        return this.raMode(body);
       case 'history':
         return this.history(body);
       case 'onboarding':
@@ -1079,8 +1209,7 @@ export class RouterService {
         return this.debug();
       case 'createTestSession':
         if (!this.config.dev) throw new HttpError(404, 'unknown-op', 'Unknown Router operation.');
-        return this.ctx.sessionController.create({
-          cwd: body.cwd ?? 'D:/tmp/dsh-ra-test',
+        return this.createSession(body.cwd ?? 'D:/tmp/dsh-ra-test', {
           ...(body.agentPreset ? { agentPreset: body.agentPreset } : {}),
         });
       case 'debugAgent':
@@ -1375,9 +1504,11 @@ export class RouterService {
   }
 
   /**
-   * Manual dispatch fallback: the user picked the target and action on the
-   * canvas, bypassing the RA. It still writes a normal pending proposal so the
-   * same confirmation and lastSeq guard apply, and it never auto-executes.
+   * Manual dispatch: the user picked the target and action on the canvas,
+   * bypassing the RA. It executes immediately because a second confirmation
+   * would only repeat the choice the user just made. The proposal record is
+   * still written (executing → confirmed/failed) for audit and failure
+   * recovery, and it never auto-executes on its own.
    */
   async manual({ project, task, action, targetSessionId, atSeq, composer }) {
     const text = String(task ?? '').trim();
@@ -1440,8 +1571,32 @@ export class RouterService {
         turn: boundary?.turn,
       }),
     };
-    await store.saveProposal(proposal);
-    return { ok: true, token, summary: proposal.summary };
+    await store.saveProposal({ ...proposal, status: 'executing', claimedAt: now });
+    const progress = {};
+    let result;
+    try {
+      result = await this.executeProposal(proposal, progress);
+    } catch (error) {
+      await store
+        .saveProposal({
+          ...proposal,
+          status: 'failed',
+          error: String(error?.message ?? error),
+          ...(progress.createdSessionId ? { resultSessionId: progress.createdSessionId } : {}),
+        })
+        .catch(() => {});
+      await this.recordHistory(
+        store,
+        proposal,
+        { result: 'failed', targetSessionId: progress.createdSessionId ?? proposal.targetSessionId },
+        'manual',
+        error,
+      );
+      throw error;
+    }
+    await store.saveProposal({ ...proposal, status: 'confirmed', result, executedAt: Date.now() });
+    await this.recordHistory(store, proposal, result, 'manual');
+    return { ok: true, token, summary: proposal.summary, result };
   }
 
   /** Abandon a pending proposal and ask the RA to judge the same task again. */
@@ -1679,6 +1834,9 @@ export class RouterService {
         allowMigration: true,
       });
       progress.createdSessionId = forked.sessionId;
+      // The fork controller only inherits a Workspace from its source Session;
+      // an ungrouped source would otherwise put the child in「未分组」too.
+      await this.attachWorkspace(proposal.project, forked.sessionId);
       await store.recordLineage(forked.sessionId, proposal.targetSessionId, { pin: true });
       if (proposal.title) await this.renameSession(store, forked.sessionId, proposal.title);
       if (settings.settings.defaultSessionModel) await this.selectSessionModel(forked.sessionId, settings.settings.defaultSessionModel);
@@ -1696,7 +1854,7 @@ export class RouterService {
       };
     }
     if (proposal.action === 'new') {
-      const created = await this.ctx.sessionController.create({ cwd: proposal.project });
+      const created = await this.createSession(proposal.project);
       progress.createdSessionId = created.sessionId;
       if (proposal.title) await this.renameSession(store, created.sessionId, proposal.title);
       if (settings.settings.defaultSessionModel) await this.selectSessionModel(created.sessionId, settings.settings.defaultSessionModel);
@@ -1777,6 +1935,77 @@ export class RouterService {
   async untracked({ project }) {
     const { untracked, store } = await this.collect(project);
     return { ok: true, items: untracked, history: await store.history(20) };
+  }
+
+  /** Every real Session in the project, with its current tracking state. */
+  async allSessions({ project }) {
+    const { allSessions } = await this.collect(project);
+    return { ok: true, items: allSessions };
+  }
+
+  /**
+   * The plan state of the project's Router Agent session.
+   *
+   * The composer's mode is a dispatch setting for the target Session, but the
+   * panel can otherwise open in a saved "plan" state while the Router session
+   * itself is not in plan mode. The client reads this on project entry so the
+   * two never disagree. It never creates or resumes the RA.
+   */
+  async raMode({ project }) {
+    const store = this.storeFor(project);
+    const state = await store.read();
+    if (!state.raSessionId) return { ok: true, sessionId: null, plan: false };
+    let projection = null;
+    try {
+      projection = await this.ctx.sessionController.projections(
+        { sessionId: state.raSessionId },
+        new AbortController().signal,
+      );
+    } catch {
+      // The router preset does not mount plan mode; an unreadable projection
+      // is treated as standard rather than resurrecting a saved "plan".
+    }
+    return {
+      ok: true,
+      sessionId: state.raSessionId,
+      plan: !!projection?.values?.plan?.active,
+    };
+  }
+
+  /**
+   * Apply one batch of checkbox changes from the all-sessions dialog.
+   *
+   * Checking means "include in the index": clear a manual stop and pin the
+   * Session so the tracking window cannot drop it. Unchecking means "stop
+   * tracking": remove the pin and record the manual stop. Unknown ids are
+   * rejected so the API cannot write arbitrary rows into the sidecar.
+   */
+  async tracking({ project, track, untrack }) {
+    const ids = (value) =>
+      Array.isArray(value)
+        ? [...new Set(value.filter((id) => typeof id === 'string' && id.trim()).map((id) => id.trim()))]
+        : [];
+    const add = ids(track);
+    const remove = ids(untrack);
+    if (add.length === 0 && remove.length === 0) return { ok: true, changed: 0 };
+    const collected = await this.collect(project);
+    const known = new Set(collected.allSessions.map((item) => item.sessionId));
+    const tracked = new Set(collected.rows.map((row) => row.sessionId));
+    for (const sessionId of add) {
+      if (!known.has(sessionId)) {
+        throw new HttpError(404, 'session-not-found', '该会话不在当前项目中。');
+      }
+    }
+    for (const sessionId of remove) {
+      if (!tracked.has(sessionId)) {
+        throw new HttpError(400, 'session-not-tracked', '该会话不在跟踪范围内。');
+      }
+    }
+    const parentOf = Object.fromEntries(
+      collected.rows.map((row) => [row.sessionId, row.parentSessionId]),
+    );
+    await collected.store.setTracking({ track: add, untrack: remove, parentOf });
+    return this.state({ project });
   }
 
   async history({ project, limit }) {
@@ -1954,7 +2183,17 @@ export class RouterService {
   }
 
   async debug() {
-    const out = { query: null, controller: null };
+    const out = { query: null, controller: null, workspaces: null };
+    try {
+      const registry = this.ctx.get?.('workspaceRegistry');
+      out.workspaces = registry?.list?.().map((workspace) => ({
+        workspaceId: String(workspace.id),
+        path: workspace.path,
+        sessionIds: [...workspace.sessionIds],
+      })) ?? null;
+    } catch (error) {
+      out.workspaces = { error: String(error?.stack ?? error) };
+    }
     try {
       const records = await this.ctx.sessionQuery.listSessions();
       out.query = {

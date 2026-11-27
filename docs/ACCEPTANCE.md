@@ -34,9 +34,9 @@
 | 24 | 详情上下文 | ✅ | 精确 used/limit/%；`02-detail` 截图 |
 | 25 | 节点无一句话/概览/血缘/T9/分支数 | ✅ | NodeCard 只渲染 title/time/context |
 | 26 | 详情无概览/血缘 | ✅ | UI 测试断言 `doesNotMatch(/概览|血缘|一句话/)` |
-| 27 | 停止跟踪 | ✅ | `stop parent...`；确认弹层；未跟踪恢复 |
+| 27 | 停止跟踪 | ✅ | `stop parent...`；确认弹层；在“全部会话”里重新勾选恢复 |
 | 28 | 父子停止语义 | ✅ | `stop parent makes child root; restore reattaches`；真实 UI 截图 |
-| 29 | 未跟踪列表 | ✅ | `05-untracked`；reason `stopped/older`；只含当前选中项目；无顶部提示；列表独立滚动、底部固定；最大高度 `min(560px, 100% - 40px)`；勾选同意后批量恢复，按钮不带数量 |
+| 29 | 全部会话 | ✅ | `05-all-sessions`；两列网格（窄面板单列）；列出当前项目全部会话，复选框表示是否纳入索引，显示 `older/stopped` 原因；勾选/取消后批量“应用更改”；只含当前选中项目；列表独立滚动、底部固定；最大高度 `min(560px, 100% - 40px)` |
 | 30 | 设置界面 | ✅ | 布局 / Router 模型（对话）/ 索引模型 / 新会话默认模型 / 自动执行追问策略 / 跟踪范围；三个模型下拉不再有“跟随部署默认”，未设置时预选部署默认模型；`settings persist auto-ask, index model...` |
 | 31 | 设置持久化 | ✅ | `settings persist...`；`.dsh_RA/state.json`；显式清空/局部更新已单测 |
 | 32 | 输入区计划模式 | ✅ | 合并进“操作权限”下拉；真实 `applySettings`：`/plan` → `plan.active=true` |
@@ -62,14 +62,18 @@
 | 52 | 派发幂等 | ✅ | `two concurrent confirms execute a route proposal once`；fork/new 失败保留 `resultSessionId` |
 | 53 | 项目切换 | ✅ | 项目下拉列出全部项目并显示“会话 · 跟踪”；`switching projects reads only that project...` |
 | 54 | 控件观感 | ✅ | 面板内自定义 tooltip；下拉箭头为 SVG 且绕中心旋转；详情压缩图标来自提供的 SVG；UI 断言 SVG 视框与旋转中心 |
-| 55 | 手动派发 | ✅ | `manual dispatch creates a normal pending proposal...`；UI `15-manual`：会话名 + 指定/分叉/新会话；强制 `auto:false` |
-| 56 | 提议纠正 | ✅ | `retry abandons...` / `manual retarget moves the target`；任务原文显示；取消/过期/409 回填输入框 |
+| 55 | 手动派发 | ✅ | `manual route executes immediately...` / `manual fork and new execute immediately...`；UI `15-manual`：会话名 + 指定/分叉/新会话；直接发送，不产生 pending 提议；强制 `auto:false` |
+| 56 | 提议纠正 | ✅ | `retry abandons...` / `retarget moves a pending RA fork...`；任务原文显示；派发/取消/失效后任务不再回填输入框 |
 | 57 | RA 失败兜底 | ✅ | 无提议时显示“Router 未完成”；`cancel task clears...`；60 秒提示 |
 | 58 | 索引确认 | ✅ | 默认 `awaiting` 不建索引；`first index waits for confirmation...`；跳过仍可 ask；`onboarding reset/start` UI 截图 |
 | 59 | 跟踪范围 | ✅ | `settings persist auto-ask, index model...`；项目下拉 tracked 计数断言 |
 | 60 | 自动追问三策略 | ✅ | `auto mode keeps asking...` / `can forbid asking...` / `can answer an ask with its first suggestion` |
 | 61 | 双模型拆分 | ✅ | 索引模型用于 `BriefPipeline.model()`；Router 模型只作用于 RA 会话；设置文案“新建和分叉” |
 | 62 | 索引续跑 | ✅ | `onboarding resumes and skips briefs already built`；running 状态在新 Host 自动续跑 |
+| 63 | 工作区归属 | ✅ | `new proposal...` / `fork proposal...` / `the Router session is created inside...` / `opening a project repairs...`；真实 API 以 `workspaceId` 创建并 attach，旧 RA 会话在 `ensureRA` 补挂，首次读取做一次性迁移 |
+| 64 | 全部会话勾选 | ✅ | `allSessions lists tracked and untracked rows; tracking applies both directions`；真实 UI 勾选后节点 13→14→13 |
+| 65 | 模式联动 | ✅ | `raMode reads the Router session plan state without creating one`；UI 预置 `composer.mode=plan`，进入面板后模式下拉显示“工作区内修改” |
+| 66 | 两列全部会话 | ✅ | UI 断言 `gridTemplateColumns` 为 2 列；`05-all-sessions` 实际渲染 |
 
 ## 真实环境额外验证
 
@@ -92,7 +96,7 @@
 ## 自动化验证
 
 ```text
-npm test        83 pass
-npm run test:ui UI acceptance passed（含手动派发条、环形进度、索引确认卡、历史入口、设置新字段、项目切换、下拉字体、勾选恢复、窄屏避让、打开会话与 Router preset 工具边界）
+npm test        88 pass
+npm run test:ui UI acceptance passed（含手动派发条、环形进度、索引确认卡、模式联动、两列全部会话、历史入口、设置新字段、项目切换、下拉字体、窄屏避让、打开会话与 Router preset 工具边界）
 npm run check   build + test
 ```

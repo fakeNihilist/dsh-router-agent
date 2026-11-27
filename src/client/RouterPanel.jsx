@@ -7,6 +7,7 @@ import { ProposalCard } from './ProposalCard.jsx';
 import { Select } from './Select.jsx';
 import { HistoryIcon, MoreIcon, RouterIcon, SearchIcon, SettingsIcon } from './icons.jsx';
 import {
+  AllSessionsModal,
   CompressModal,
   HistoryModal,
   IndexBanner,
@@ -14,7 +15,6 @@ import {
   SettingsModal,
   StopModal,
   Toast,
-  UntrackedModal,
 } from './Modals.jsx';
 import { boundsOf, buildLayout, centerOn, clamp, fitSelection } from './layout.js';
 
@@ -56,6 +56,7 @@ export function RouterPanel({ openSession }) {
   dataRef.current = data;
   const historySeen = useRef(new Set());
   const composerProject = useRef(null);
+  const modeSyncProject = useRef(null);
   const fitKey = useRef('');
   const lastFit = useRef(null);
   const timerRef = useRef(0);
@@ -111,6 +112,29 @@ export function RouterPanel({ openSession }) {
     );
     setAuto(!!composer.auto);
   }, [data?.settings?.composer, data?.selectedProject?.project]);
+
+  // The saved composer mode is a dispatch preference for target Sessions, but
+  // the Router Agent session has its own plan state. On project entry, follow
+  // the RA session so the panel cannot open in 「计划模式」 while the
+  // corresponding Router session is standard (or vice versa).
+  useEffect(() => {
+    const key = data?.selectedProject?.project;
+    if (!key || modeSyncProject.current === key) return undefined;
+    modeSyncProject.current = key;
+    let alive = true;
+    apiOp('raMode', { project: key })
+      .then((result) => {
+        if (!alive || !result) return;
+        setMode(result.plan ? 'plan' : 'standard');
+        if (result.plan) setPermissions('workspace-write');
+      })
+      .catch(() => {
+        // Leave the saved preference; a failed read must not reset the form.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [data?.selectedProject?.project]);
 
   const tree = data?.tree ?? { sessions: [], edges: [], roots: [], trackedCount: 0 };
   const layoutMode = data?.settings?.layout === 'horizontal' ? 'horizontal' : 'vertical';
@@ -214,8 +238,9 @@ export function RouterPanel({ openSession }) {
     }
   }, [data?.history]);
 
-  // A proposal that disappears without a local confirm/abandon (expired token,
-  // another tab, lastSeq 409) must not take the user's task with it.
+  // A proposal that disappears outside this panel (expired token, another tab,
+  // lastSeq 409) only raises a notice. The task was already handed to the
+  // Router, so it must not reappear in the composer.
   useEffect(() => {
     const list = data?.pending ?? [];
     const projectKey = data?.selectedProject?.project ?? null;
@@ -228,13 +253,10 @@ export function RouterPanel({ openSession }) {
     for (const [token, proposal] of pendingTokens.current) {
       if (current.has(token) || settledTokens.current.has(token)) continue;
       if (proposal.project && projectKey && proposal.project !== projectKey) continue;
-      if (proposal.task) {
-        setTask((value) => (value.trim() ? value : proposal.task));
-        setToast('提议已失效，任务已回到输入框。');
-      }
+      setToast('提议已失效。');
     }
     pendingTokens.current = current;
-  }, [data?.pending, data?.selectedProject?.project, setTask]);
+  }, [data?.pending, data?.selectedProject?.project]);
 
   // The Host records the active task before the Agent starts. If the Agent
   // goes idle without producing a proposal, surface an actionable failure
@@ -306,25 +328,42 @@ export function RouterPanel({ openSession }) {
     const text = task.trim();
     if (!text || !selected || disabled) return;
     try {
-      await run(
-        () =>
-          apiOp('manual', {
-            project: data.selectedProject.project,
-            task: text,
-            action,
-            targetSessionId: action === 'new' ? null : selected.sessionId,
-            atSeq: action === 'fork' ? atSeq : null,
-            composer: { mode, permissions, auto: false },
-          }),
-        '已生成待确认提议。',
-      );
+      await run(async () => {
+        const response = await apiOp('manual', {
+          project: data.selectedProject.project,
+          task: text,
+          action,
+          targetSessionId: action === 'new' ? null : selected.sessionId,
+          atSeq: action === 'fork' ? atSeq : null,
+          composer: { mode, permissions, auto: false },
+        });
+        const result = response.result;
+        const id = result?.sessionId ?? result?.targetSessionId;
+        if (id) {
+          setNewIds((current) => new Set(current).add(id));
+          window.setTimeout(() => {
+            setNewIds((current) => {
+              const next = new Set(current);
+              next.delete(id);
+              return next;
+            });
+          }, 2400);
+          if (result.result === 'forked' || result.result === 'created') setSelectedId(id);
+        }
+        return response;
+      }, action === 'fork' ? '已分叉并发送。' : action === 'new' ? '已新建并发送。' : '已发送。');
       setTask('');
     } catch {
-      // run() already surfaced the error.
+      // run() already surfaced the error and the task stays in the composer
+      // because the dispatch did not happen.
     }
   };
 
   const confirm = async (proposal) => {
+    // Mark first: the refresh inside run() can drop this proposal before the
+    // success continuation runs, and a confirmed send must never refill the
+    // composer.
+    settledTokens.current.add(proposal.token);
     try {
       await run(async () => {
         const response = await apiOp('confirm', {
@@ -346,11 +385,9 @@ export function RouterPanel({ openSession }) {
         }
         return response;
       }, '已确认并发送。');
-      settledTokens.current.add(proposal.token);
     } catch {
-      // target-changed / expired / 409: keep the task in the input so it is
-      // not lost while the user re-judges or picks another target.
-      if (proposal.task) setTask((value) => (value.trim() ? value : proposal.task));
+      // run() already surfaced the Host error; the task stays out of the
+      // composer because it was already sent to the Router.
     }
   };
 
@@ -362,37 +399,36 @@ export function RouterPanel({ openSession }) {
   };
 
   const abandon = async (proposal) => {
+    settledTokens.current.add(proposal.token);
     try {
       await run(
         () => apiOp('abandon', { project: data.selectedProject.project, token: proposal.token }),
-        '提议已取消，任务已回到输入框。',
+        '提议已取消。',
       );
-      settledTokens.current.add(proposal.token);
-      if (proposal.task) setTask((value) => (value.trim() ? value : proposal.task));
     } catch {
       // run() already surfaced the error.
     }
   };
 
   const answer = async (proposal, value) => {
+    settledTokens.current.add(proposal.token);
     try {
       await run(
         () => apiOp('answer', { project: data.selectedProject.project, token: proposal.token, answer: value }),
         '已回答 Router。',
       );
-      settledTokens.current.add(proposal.token);
     } catch {
       // run() already surfaced the error.
     }
   };
 
   const retry = async (proposal, note) => {
+    settledTokens.current.add(proposal.token);
     try {
       await run(
         () => apiOp('retry', { project: data.selectedProject.project, token: proposal.token, note }),
         note ? '已带着纠正交给 Router 重新判断。' : '已请 Router 重新判断。',
       );
-      settledTokens.current.add(proposal.token);
     } catch {
       // run() already surfaced the error.
     }
@@ -452,19 +488,28 @@ export function RouterPanel({ openSession }) {
   const stop = async (session) => {
     await run(
       () => apiOp('stop', { project: data.selectedProject.project, sessionId: session.sessionId }),
-      '已停止跟踪；可在“未跟踪会话”中恢复。',
+      '已停止跟踪；可在“全部会话”中重新勾选。',
     ).catch(() => {});
     if (selectedId === session.sessionId) setSelectedId(null);
   };
 
-  const restoreMany = async (ids) => {
-    const list = Array.isArray(ids) ? ids : [];
-    if (!list.length) return;
-    await run(async () => {
-      for (const sessionId of list) {
-        await apiOp('restore', { project: data.selectedProject.project, sessionId });
-      }
-    }, list.length === 1 ? '已恢复跟踪。' : `已恢复 ${list.length} 个会话。`);
+  const applyTracking = async ({ track, untrack }) => {
+    const added = track?.length ?? 0;
+    const removed = untrack?.length ?? 0;
+    const message =
+      added > 0 && removed > 0
+        ? `已索引 ${added} 个会话，取消索引 ${removed} 个。`
+        : added > 0
+          ? added === 1
+            ? '已纳入索引。'
+            : `已纳入索引 ${added} 个会话。`
+          : removed === 1
+            ? '已取消索引。'
+            : `已取消索引 ${removed} 个会话。`;
+    await run(
+      () => apiOp('tracking', { project: data.selectedProject.project, track, untrack }),
+      message,
+    );
   };
 
   const rename = async (sessionId, title) => {
@@ -570,7 +615,7 @@ export function RouterPanel({ openSession }) {
           <button className="dra-icon-btn" type="button" title="Router 设置" onClick={() => setModal('settings')}>
             <SettingsIcon />
           </button>
-          <button className="dra-icon-btn" type="button" title="未跟踪会话" onClick={() => setModal('untracked')}>
+          <button className="dra-icon-btn" type="button" title="全部会话" onClick={() => setModal('sessions')}>
             <MoreIcon />
           </button>
         </div>
@@ -612,7 +657,7 @@ export function RouterPanel({ openSession }) {
             </h3>
             <p>
               {data?.selectedProject
-                ? `只跟踪最近 ${data?.settings?.trackingDays ?? 7} 天有活动的会话。可以去“未跟踪会话”恢复更早的会话，或先在 DSH 中继续一个会话。`
+                ? `只跟踪最近 ${data?.settings?.trackingDays ?? 7} 天有活动的会话。可以在“全部会话”里勾选更早的会话，或先在 DSH 中继续一个会话。`
                 : '先在 DSH 中打开一个项目并创建会话。'}
             </p>
           </div>
@@ -749,10 +794,10 @@ export function RouterPanel({ openSession }) {
           onClose={() => setModal(null)}
         />
       ) : null}
-      {modal === 'untracked' ? (
-        <UntrackedModal
-          items={data?.untracked ?? []}
-          onRestore={restoreMany}
+      {modal === 'sessions' ? (
+        <AllSessionsModal
+          items={data?.allSessions ?? []}
+          onApply={applyTracking}
           onClose={() => setModal(null)}
         />
       ) : null}

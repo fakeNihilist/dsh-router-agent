@@ -806,9 +806,19 @@ export const CSS = `
   background: var(--dra-layer);
   box-shadow: var(--dra-shadow);
 }
-.dra-modal-untracked {
-  /* Many older sessions must not grow the dialog to the full panel height. */
+.dra-modal-sessions {
+  /* Two columns need room for two titles while the dialog stays compact. */
+  width: min(760px, 100%);
+  /* Many sessions must not grow the dialog to the full panel height. */
   max-height: min(560px, calc(100% - 40px));
+}
+.dra-modal-sessions .dra-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+}
+@container (max-width: 620px) {
+  .dra-modal-sessions .dra-list { grid-template-columns: minmax(0, 1fr); }
 }
 .dra-modal-head {
   display: flex;

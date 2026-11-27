@@ -137,7 +137,7 @@ export function Composer({
             ) : (
               <span className="dra-manual-hint">
                 {manualAction === 'route'
-                  ? '发送后仍需确认'
+                  ? '立即发送到该会话'
                   : '不继承选中会话的上下文'}
               </span>
             )}
@@ -178,7 +178,7 @@ export function Composer({
         <Tip
           label={
             manual
-              ? '手动派发始终需要确认，不使用自动执行'
+              ? '手动派发直接发送，不使用自动执行'
               : '开启后 RA 判断完直接执行，不再确认'
           }
         >
@@ -200,7 +200,7 @@ export function Composer({
           type="button"
           disabled={!task.trim() || busy || disabled || (manual && manualAction === 'fork' && !atSeq)}
           onClick={submit}
-          title={manual ? '生成待确认提议，确认后才发送' : undefined}
+          title={manual ? '直接发送，不再确认' : undefined}
           data-send
         >
           {busy ? '发送中…' : '发送'}

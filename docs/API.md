@@ -8,7 +8,7 @@
 
 ### `GET /api/router/state?project=<cwd>`
 
-返回面板的唯一读模型。`project` 决定画布和未跟踪列表读取哪个项目；省略时选择最近活跃的项目。
+返回面板的唯一读模型。`project` 决定画布和“全部会话”列表读取哪个项目；省略时选择最近活跃的项目。
 
 ```json
 {
@@ -43,6 +43,10 @@
     "untrackedCount": 3
   },
   "untracked": [{ "sessionId": "session-...", "title": "旧会话", "reason": "older", "lastActiveLabel": "11/8" }],
+  "allSessions": [
+    { "sessionId": "session-...", "title": "登录页表单校验", "tracked": true, "reason": null, "turns": 2, "lastActiveLabel": "14:39" },
+    { "sessionId": "session-old", "title": "旧会话", "tracked": false, "reason": "older", "lastActiveLabel": "11/8" }
+  ],
   "settings": {
     "layout": "vertical",
     "raModel": null,
@@ -60,7 +64,8 @@
 }
 ```
 
-- 树和未跟踪列表始终只读取 `selectedProject` 的 cwd；`state()` 传入的全局摘要会先按项目过滤，不会跨项目泄漏。切换 `project` 会重建这两部分。
+- 树和“全部会话”列表始终只读取 `selectedProject` 的 cwd；`state()` 传入的全局摘要会先按项目过滤，不会跨项目泄漏。切换 `project` 会重建这两部分。
+- `allSessions` 是当前项目的全部真实会话（排除 Router 会话、subagent 与空白 starter 会话）；`tracked` 表示当前是否纳入索引，`reason` 为未纳入时的原因：`stopped | older`。`untracked` 是它的兼容子集。
 - 根/兄弟顺序由客户端用 `lastActiveAt` 计算；`edges` 是 sidecar 解析后的父子关系。
 - `context.source` 为 `projection`（`contextPressure`）、`fold`（`assistant/message.usage` + `request/context.contextWindow`）或 `unknown`。
 - `lastActiveAt` 优先取日志末尾事件时间（不是最后一次用户提问时间）。
@@ -111,7 +116,23 @@ content-type: application/json
 { "op": "manual", "project": "...", "task": "手动发到父会话", "action": "route", "targetSessionId": "session-p", "atSeq": 16, "composer": { "mode": "standard", "permissions": "workspace-write" } }
 ```
 
-用户选中画布节点后的手动派发兜底。`action` 只接受 `route | fork | new`；`fork` 省略 `atSeq` 时取目标最后一个 `turn/end`。只写一条 `manual: true`、`auto: false` 的 pending 提议，仍然必须 `confirm`，因此 token/项目/expiry/`lastSeq` 校验与 RA 提议完全相同；手动派发不会自动执行。
+用户选中画布节点后的手动派发。`action` 只接受 `route | fork | new`；`fork` 省略 `atSeq` 时取目标最后一个 `turn/end`。用户在手动模式已经明确目标和动作，因此 Host 直接执行（`manual: true`、`auto: false`），不再生成待确认提议；提议文件仍以 `executing → confirmed/failed` 写入，用于审计与 `resultSessionId` 失败恢复。
+
+返回：
+
+```json
+{ "ok": true, "token": "<uuid>", "summary": "继续「父会话」", "result": { "result": "sent", "targetSessionId": "session-p", "dispatch": { "plan": { "before": false, "after": false }, "permissions": { "before": "workspace-write", "after": "workspace-write" } } } }
+```
+
+`fork` / `new` 的 `result` 额外带新建或分叉出的 `sessionId`；失败时直接返回错误，不会留下 pending 提议。
+
+### `raMode`
+
+```json
+{ "op": "raMode", "project": "..." }
+```
+
+只读读取该项目 Router Agent 会话的 `plan` 投影，返回 `{ ok, sessionId, plan }`。面板进入项目时用它对齐“操作权限”下拉，避免保存过“计划模式”而 Router 会话实际不是；不会创建或恢复 RA，读不到时按 `plan: false` 处理。
 
 ### `retry`
 
@@ -119,7 +140,7 @@ content-type: application/json
 { "op": "retry", "project": "...", "token": "<uuid>", "note": "应该分叉，不要改父会话" }
 ```
 
-把原提议标为 `abandoned`（历史结果 `revised`），把 `任务原文 + 设置 + 用户要求重新判断：...` 发回 RA。`note` 最长 500 字，可为空。prompt 发送失败会把提议恢复为 pending。只适用于 RA 生成的提议；`manual: true` 的提议返回 `400 manual-proposal`。
+把原提议标为 `abandoned`（历史结果 `revised`），把 `任务原文 + 设置 + 用户要求重新判断：...` 发回 RA。`note` 最长 500 字，可为空。prompt 发送失败会把提议恢复为 pending。只适用于 RA 生成的 pending 提议；`manual: true` 的提议返回 `400 manual-proposal`。
 
 ### `retarget`
 
@@ -147,8 +168,9 @@ content-type: application/json
 
 - 以 compare-and-set 把提议从 `pending` 认领为 `executing`；并发/重复确认只允许一个执行，其余返回 `409 proposal-executing` 或 `proposal-not-pending`。
 - `route`：`sessionController.prompt({ mode:'queue', sessionId, content:[{type:'text',text:task}] }, signal)`
-- `fork`：`sessionController.fork({ sessionId, atSeq, allowMigration:true })`，写 sidecar lineage，再 prompt 子会话
-- `new`：`sessionController.create({ cwd })`，应用默认模型，再 prompt
+- `fork`：`sessionController.fork({ sessionId, atSeq, allowMigration:true })`，写 sidecar lineage；若项目目录属于某个 DSH Workspace，再把子会话 `attachSession` 进去，最后 prompt 子会话
+- `new`：项目目录属于某个 DSH Workspace 时用 `sessionController.create({ workspaceId })`，否则退回 `create({ cwd })`；应用默认模型，再 prompt
+- 新建/分叉/ensureRA 都通过 Workspace 成员关系归属项目，不会落到 DSH 侧栏「未分组」；旧版遗留的 Router 会话在 `ensureRA` 时幂等补挂。首次读取项目时还会一次性迁移：cwd 属于该项目、非 subagent、未归档且不在成员表里的会话会被 `attachSession`。
 - 目标 lastSeq 读不到时返回 `409 target-unreadable`，不会盲发。
 - fork/new 已创建会话后失败：提议标为 `failed` 并记录 `resultSessionId`，不会在重试时创建第二个子会话；route 在 prompt 前失败会退回 `pending` 供重试。
 
@@ -166,7 +188,7 @@ content-type: application/json
 { "op": "choose", "project": "...", "token": "<uuid>", "atSeq": 12 }
 ```
 
-只对 `fork` 提议有效；必须是目标会话已完成的 `turn/end` seq。更新后仍需 `confirm`。与确认一样用 compare-and-set，提议已进入执行时返回 `409 proposal-not-pending`。
+只对 `fork` 提议有效；必须是目标会话已完成的 `turn/end` seq。更新后仍需 `confirm`。与确认一样用 compare-and-set，提议已进入执行时返回 `409 proposal-not-pending`。手动派发已直接执行，不会产生可换目标的 pending 提议。
 
 ### `abandon`
 
@@ -211,7 +233,7 @@ content-type: application/json
 ```
 
 `stop` 只写 `state.stopped[id]`；不删除会话。父会话停止后，跟踪中的子会话在树里自然成为根。
-`restore` 删除 stopped 并写 `state.pinned[id] = true`，因此更早的会话恢复后也会重新跟踪。
+`restore` 删除 stopped 并写 `state.pinned[id] = true`，因此更早的会话恢复后也会重新跟踪；新的批量勾选走 `tracking`。
 
 ### `settings`
 
@@ -240,16 +262,20 @@ content-type: application/json
 
 先写 sidecar `titles[id]`，再尽力 `sessionController.rename`。侧车标题优先展示；不会覆盖用户自己的原生标题。
 
-### `untracked` / `history` / `onboarding` / `refresh`
+### `allSessions` / `tracking` / `untracked` / `history` / `onboarding` / `refresh`
 
 ```json
+{ "op": "allSessions", "project": "..." }
+{ "op": "tracking", "project": "...", "track": ["session-old"], "untrack": ["session-x"] }
 { "op": "untracked", "project": "..." }
 { "op": "history", "project": "...", "limit": 50 }
 { "op": "onboarding", "project": "...", "action": "start|skip|retry" }
 { "op": "refresh", "project": "..." }
 ```
 
-- `untracked`：`{ ok, items }`，reason 为 `stopped | older`。
+- `allSessions`：`{ ok, items }`，列出当前项目全部真实会话及其 `tracked` 状态，供“全部会话”弹窗使用。
+- `tracking`：批量应用勾选结果。`track` 清除手动停止并写 `pinned`；`untrack` 删除 `pinned` 并写 `stopped`（来自树行的 `parentSessionId` 一并记录）。未知 id 返回 `404 session-not-found`；取消一个不在跟踪范围内的会话返回 `400 session-not-tracked`。成功后返回完整 state。
+- `untracked`：`{ ok, items }`，reason 为 `stopped | older`（兼容旧调用方；UI 已改用 `allSessions`）。
 - `history`：`{ ok, items }`，最新在前。
 - `onboarding`：`start` 启动或续跑首次索引（已完成的 brief 会跳过）；`skip` 写 `status: skipped`，仍允许路由；`retry` 重新启动 dirty/failed 项。`reset` 仅在 `config.dev` 下可用，把状态置回 `awaiting` 供验收测试使用。
 - `refresh`：返回完整 state。
@@ -342,7 +368,7 @@ content-type: application/json
 }
 ```
 
-`status=executing` 是确认/自动执行的认领态，只有持锁的调用会推进；15 分钟仍为 executing 会被视为中断失败。fork/new 失败时 `resultSessionId` 记录已创建的会话，避免重试重复创建。`manual: true` 表示由画布手动派发；`answer` 记录追问/自动建议项的回答。
+`status=executing` 是确认/自动执行/手动直发的认领态，只有持锁的调用会推进；15 分钟仍为 executing 会被视为中断失败。fork/new 失败时 `resultSessionId` 记录已创建的会话，避免重试重复创建。`manual: true` 表示由画布手动派发（已直接执行，状态为 confirmed/failed）；`answer` 记录追问/自动建议项的回答。
 
 ### dispatch.jsonl
 
@@ -372,7 +398,7 @@ content-type: application/json
 
 ### `ra_tree`
 
-参数：`{ includeStopped?: boolean }`。返回项目、跟踪会话（id/title/lastActive/turns/running/contextPercent/boundaries/boundaryCount）；`includeStopped` 只额外返回 `stoppedCount`，停止的会话不可路由，需先在 UI 恢复。每个会话最多返回最近 30 个边界，`boundaryCount` 是完整数量。
+参数：`{ includeStopped?: boolean }`。返回项目、跟踪会话（id/title/lastActive/turns/running/contextPercent/boundaries/boundaryCount）；`includeStopped` 只额外返回 `stoppedCount`，停止的会话不可路由，需先在 UI 的“全部会话”里重新勾选。每个会话最多返回最近 30 个边界，`boundaryCount` 是完整数量。
 
 ### `ra_brief`
 

@@ -298,24 +298,30 @@ export class BriefPipeline {
         todo.push(row);
       }
     }
+    // A superseded run must not restart a terminal onboarding state or
+    // overwrite a newer failed/complete write at the end.
+    let manageOnboarding = false;
     if (onboarding) {
       const state = await this.store.read();
-      await this.store.onboarding({
-        status: 'running',
-        total: unique.length,
-        done,
-        startedAt: state.onboarding.startedAt ?? new Date().toISOString(),
-        completedAt: null,
-        current: null,
-        failed: [],
-      });
+      manageOnboarding = state.onboarding.status === 'running';
+      if (manageOnboarding) {
+        await this.store.onboarding({
+          status: 'running',
+          total: unique.length,
+          done,
+          startedAt: state.onboarding.startedAt ?? new Date().toISOString(),
+          completedAt: null,
+          current: null,
+          failed: [],
+        });
+      }
     }
     let index = 0;
     let lastProgress = 0;
     let lastCurrent = 0;
     const failed = [];
     const publish = async (force = false) => {
-      if (!onboarding) return;
+      if (!manageOnboarding) return;
       const now = Date.now();
       if (!force && now - lastProgress < 300) return;
       lastProgress = now;
@@ -324,7 +330,7 @@ export class BriefPipeline {
     const worker = async () => {
       while (index < todo.length) {
         const row = todo[index++];
-        if (onboarding) {
+        if (manageOnboarding) {
           const now = Date.now();
           if (now - lastCurrent >= 300) {
             lastCurrent = now;
@@ -341,14 +347,17 @@ export class BriefPipeline {
       }
     };
     await Promise.all(Array.from({ length: Math.min(this.concurrency, Math.max(1, todo.length)) }, worker));
-    if (onboarding) {
-      await this.store.onboarding({
-        status: 'complete',
-        done,
-        current: null,
-        completedAt: new Date().toISOString(),
-        failed,
-      });
+    if (manageOnboarding) {
+      const latest = await this.store.read();
+      if (latest.onboarding.status === 'running') {
+        await this.store.onboarding({
+          status: 'complete',
+          done,
+          current: null,
+          completedAt: new Date().toISOString(),
+          failed,
+        });
+      }
     }
     return { done, failed };
   }

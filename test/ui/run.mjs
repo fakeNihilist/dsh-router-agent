@@ -145,7 +145,9 @@ async function seed() {
         tables: {
           workspaces: {
             'ui-fixture-workspace': {
-              path: PROJECT,
+              // Canonical path: attachSession validates a realpath-normalized
+              // Session cwd against this exact string.
+              path: resolve(PROJECT),
               title: 'dsh-ra-test',
               sessionIds: fixtures.map((row) => row.id),
               createdAt: new Date(now - 30 * 24 * 3600_000).toISOString(),
@@ -344,6 +346,19 @@ async function assertRouterBoundary(server) {
   });
   const tools = [...(debug.tools ?? [])].sort();
   assert.deepEqual(tools, ['ra_brief', 'ra_history', 'ra_propose', 'ra_tree']);
+  // Both dev-created Sessions went through createSession({workspaceId}); they
+  // must be Workspace members, not sidebar「未分组」entries.
+  const hostDebug = await postJson(`${server.base}/api/router/api`, server.cookie, { op: 'debug' });
+  const workspace = hostDebug.workspaces?.find((item) =>
+    String(item.path).replaceAll('\\', '/').toLowerCase() === PROJECT.toLowerCase(),
+  );
+  assert.ok(workspace, 'fixture Workspace missing from the Host registry');
+  for (const sessionId of [created.sessionId, target.sessionId]) {
+    assert.ok(
+      workspace.sessionIds.includes(sessionId),
+      `created Session ${sessionId} did not join the Workspace`,
+    );
+  }
   console.log('router boundary', JSON.stringify({ preset: debug.preset, tools, dispatch }));
 }
 
@@ -428,6 +443,13 @@ async function main() {
   await ensureProfile();
   const { child, fixtures } = await seed();
   const server = await startServer();
+  // A saved dispatch preference of plan must not make the panel claim the
+  // Router session is in plan mode; the Router preset has no plan mode.
+  await postJson(`${server.base}/api/router/api`, server.cookie, {
+    op: 'settings',
+    project: PROJECT,
+    settings: { composer: { mode: 'plan' } },
+  });
   await assertRouterBoundary(server);
   // Prebuild the second project's brief so switching projects in the UI does
   // not pause on the onboarding overlay. The session list scan can lag the
@@ -514,10 +536,12 @@ async function main() {
       onboarding: document.body.innerText.includes('首次接入：建立会话索引'),
       pill: document.querySelector('.dra-project')?.innerText ?? '',
       projectLabel: document.querySelector('.dra-project .dra-select-value')?.textContent ?? '',
+      mode: document.querySelector('.dra-operation-select .dra-select-value')?.textContent ?? '',
     }))()`);
     console.log('summary', JSON.stringify(summary));
     assert.equal(summary.nodes, 13, 'expected 13 tracked nodes');
     assert.equal(summary.edges, 5, 'expected 5 parent→child edges');
+    assert.equal(summary.mode, '工作区内修改', 'the composer follows the RA session, not a stale plan setting');
     assert.equal(String(summary.project).split(String.fromCharCode(92)).join('/'), PROJECT);
     assert.ok(summary.countText.includes('16 会话'));
     assert.ok(summary.countText.includes('13 跟踪'), 'project label reports the tracked subset');
@@ -614,8 +638,8 @@ async function main() {
     );
     await screenshot('01-project-menu');
 
-    // Selecting another project rebuilds both the canvas and the untracked
-    // list, instead of only changing the header label.
+    // Selecting another project rebuilds both the canvas and the session list,
+    // instead of only changing the header label.
     await evaluate(`(() => {
       const option = [...document.querySelectorAll('.dra-select-pop [role="option"]')]
         .find((item) => item.textContent.includes('dsh-ra-ui-other'));
@@ -630,17 +654,15 @@ async function main() {
       await evaluate("document.querySelector('.dra-node-title')?.textContent ?? ''"),
       '路由插件设计',
     );
-    await evaluate("document.querySelector('button[title=\\\"未跟踪会话\\\"]')?.click()");
+    await evaluate("document.querySelector('button[title=\\\"全部会话\\\"]')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
-    assert.match(
-      await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''"),
-      /没有未跟踪的会话/,
-      'the untracked list belongs to the selected project',
-    );
+    const otherSessions = await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''");
+    assert.match(otherSessions, /路由插件设计/, 'the session list belongs to the selected project');
+    assert.doesNotMatch(otherSessions, /登录页表单校验/, 'no fixtures from the previous project');
     await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
     await sleep(200);
 
-    // Back to the fixture project: 13 nodes and its untracked sessions return.
+    // Back to the fixture project: 13 nodes and its full session list return.
     await evaluate("document.querySelector('.dra-project .dra-select-trigger')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-select-pop')", 4000);
     await evaluate(`(() => {
@@ -798,40 +820,83 @@ async function main() {
     assert.ok(horizontal.child.left > horizontal.parent.right, 'horizontal fork must grow right');
     await screenshot('04-horizontal');
 
-    // Untracked modal lists the three older fixtures and asks for an explicit
-    // checkbox consent before anything can be restored.
-    await evaluate("document.querySelector('button[title=\\\"未跟踪会话\\\"]')?.click()");
+    // The all-sessions dialog lists every fixture with its tracking state:
+    // checked means indexed, unchecked means excluded from the index.
+    await evaluate("document.querySelector('button[title=\\\"全部会话\\\"]')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
-    const untracked = await evaluate(`(() => {
+    const sessionsDialog = await evaluate(`(() => {
       const modal = document.querySelector('.dra-modal');
       const body = modal?.querySelector('.dra-modal-body');
       const foot = modal?.querySelector('.dra-modal-foot');
-      const restore = [...(foot?.querySelectorAll('button') ?? [])].find((item) => item.textContent.includes('恢复所选'));
+      const apply = [...(foot?.querySelectorAll('button') ?? [])].find((item) => item.textContent.includes('应用更改'));
       return {
         text: modal?.innerText ?? '',
         checks: modal?.querySelectorAll('.dra-check').length,
-        restoreDisabled: restore?.disabled,
-        restoreLabel: restore?.textContent.trim() ?? '',
+        checked: modal?.querySelectorAll('.dra-check:checked').length,
+        columns: (() => {
+          const list = modal?.querySelector('.dra-list');
+          return list ? getComputedStyle(list).gridTemplateColumns.split(' ').length : 0;
+        })(),
+        applyDisabled: apply?.disabled,
+        applyLabel: apply?.textContent.trim() ?? '',
+        count: modal?.querySelector('.dra-modal-count')?.textContent ?? '',
         bodyOverflow: body ? getComputedStyle(body).overflowY : '',
         modalOverflow: modal ? getComputedStyle(modal).overflow : '',
         footOutside: Boolean(body && foot && !body.contains(foot)),
       };
     })()`);
-    assert.match(untracked.text, /旧版：导出修复/);
-    assert.match(untracked.text, /旧版：CSV 转义/);
-    assert.match(untracked.text, /旧版：登录态过期/);
-    assert.doesNotMatch(untracked.text, /勾选同意恢复的会话/, 'the hint line is gone');
-    assert.equal(untracked.checks, 3, 'each untracked session gets a checkbox');
-    assert.equal(untracked.restoreDisabled, true, 'restore stays disabled until a session is checked');
-    assert.equal(untracked.restoreLabel, '恢复所选', 'restore label carries no count');
-    assert.equal(untracked.bodyOverflow, 'auto', 'only the dialog body scrolls');
-    assert.equal(untracked.modalOverflow, 'hidden', 'the dialog itself does not scroll');
-    assert.equal(untracked.footOutside, true, 'the action row sits outside the scrolling body');
-    await screenshot('05-untracked');
+    assert.match(sessionsDialog.text, /旧版：导出修复/);
+    assert.match(sessionsDialog.text, /旧版：CSV 转义/);
+    assert.match(sessionsDialog.text, /旧版：登录态过期/);
+    assert.match(sessionsDialog.text, /勾选表示纳入 Router 索引/);
+    assert.equal(sessionsDialog.checks, 16, 'every project session gets a checkbox');
+    assert.equal(sessionsDialog.checked, 13, 'the 13 tracked fixtures start checked');
+    assert.equal(sessionsDialog.columns, 2, 'the session list uses a two-column layout');
+    assert.equal(sessionsDialog.applyDisabled, true, 'apply stays disabled without a change');
+    assert.equal(sessionsDialog.applyLabel, '应用更改', 'apply label carries no count');
+    assert.match(sessionsDialog.count, /13 \/ 16/);
+    assert.equal(sessionsDialog.bodyOverflow, 'auto', 'only the dialog body scrolls');
+    assert.equal(sessionsDialog.modalOverflow, 'hidden', 'the dialog itself does not scroll');
+    assert.equal(sessionsDialog.footOutside, true, 'the action row sits outside the scrolling body');
+    await screenshot('05-all-sessions');
+    // Checking an older Session and applying adds it to the index.
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll('.dra-modal .dra-check-row')].find((item) => item.innerText.includes('旧版：导出修复'));
+      row?.querySelector('input[type="checkbox"]')?.click();
+    })()`);
+    await sleep(200);
+    assert.equal(
+      await evaluate("document.querySelector('.dra-modal-foot .dra-btn-primary')?.disabled"),
+      false,
+      'checking an older session enables apply',
+    );
+    await evaluate(`(() => { const button = [...document.querySelectorAll('.dra-modal-foot button')].find((item) => item.textContent.includes('应用更改')); button?.click(); })()`);
+    await waitFor(evaluate, "document.querySelectorAll('.dra-node').length === 14", 8000);
+    // Unchecking removes it again.
+    await evaluate("document.querySelector('button[title=\\\"全部会话\\\"]')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll('.dra-modal .dra-check-row')].find((item) => item.innerText.includes('旧版：导出修复'));
+      row?.querySelector('input[type="checkbox"]')?.click();
+    })()`);
+    await evaluate(`(() => { const button = [...document.querySelectorAll('.dra-modal-foot button')].find((item) => item.textContent.includes('应用更改')); button?.click(); })()`);
+    await waitFor(evaluate, "document.querySelectorAll('.dra-node').length === 13", 8000);
+    // Reopen: the row is unchecked and explains why it left the index.
+    await evaluate("document.querySelector('button[title=\\\"全部会话\\\"]')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
+    assert.match(
+      await evaluate("document.querySelector('.dra-modal')?.innerText ?? ''"),
+      /已手动取消索引|超出跟踪范围/,
+      'the session returns to the unchecked state',
+    );
+    await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
+    await sleep(200);
     // A long list must stay capped and scroll inside the body; the action row
     // must remain pinned at the dialog bottom.
+    await evaluate("document.querySelector('button[title=\\\"全部会话\\\"]')?.click()");
+    await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
     const capped = await evaluate(`(() => {
-      const modal = document.querySelector('.dra-modal-untracked');
+      const modal = document.querySelector('.dra-modal-sessions');
       const body = modal?.querySelector('.dra-modal-body');
       const list = body?.querySelector('.dra-list');
       const row = list?.firstElementChild;
@@ -847,13 +912,13 @@ async function main() {
         maxHeight: getComputedStyle(modal).maxHeight,
       };
     })()`);
-    assert.ok(capped, 'untracked dialog missing');
+    assert.ok(capped, 'sessions dialog missing');
     assert.ok(capped.modalHeight <= 561, `dialog height must stay capped, got ${capped.modalHeight}`);
     assert.ok(capped.modalHeight < capped.viewportHeight - 80, 'dialog keeps breathing room around the panel');
     assert.equal(capped.bodyScrolls, true, 'long lists scroll inside the body');
     assert.equal(capped.footerInside, true, 'footer stays at the dialog bottom');
     assert.match(capped.maxHeight, /560px/);
-    await screenshot('05-untracked-long');
+    await screenshot('05-all-sessions-long');
     await evaluate("document.querySelector('.dra-modal-head button[title=\\\"关闭\\\"]')?.click()");
 
     // History is the dispatch audit view plus a direct RA-session entry; the
@@ -889,7 +954,7 @@ async function main() {
     assert.ok(childAfterStop, 'child remains tracked after the parent stops');
     await screenshot('07-stop-parent');
 
-    await evaluate("document.querySelector('button[title=\\\"未跟踪会话\\\"]')?.click()");
+    await evaluate("document.querySelector('button[title=\\\"全部会话\\\"]')?.click()");
     await waitFor(evaluate, "!!document.querySelector('.dra-modal')", 4000);
     await evaluate(`(() => {
       const row = [...document.querySelectorAll('.dra-modal .dra-check-row')].find((item) => item.innerText.includes('登录页表单校验'));
@@ -897,18 +962,20 @@ async function main() {
     })()`);
     await sleep(200);
     const consent = await evaluate(`(() => {
-      const button = [...document.querySelectorAll('.dra-modal-foot button')].find((item) => item.textContent.includes('恢复所选'));
+      const button = [...document.querySelectorAll('.dra-modal-foot button')].find((item) => item.textContent.includes('应用更改'));
       return {
         disabled: button?.disabled,
         counted: document.querySelector('.dra-modal-count')?.textContent ?? '',
         checks: document.querySelectorAll('.dra-modal .dra-check').length,
+        checked: document.querySelectorAll('.dra-modal .dra-check:checked').length,
       };
     })()`);
-    console.log('untracked consent', JSON.stringify(consent));
-    assert.equal(consent.checks, 4, 'the stopped parent joins the untracked list');
-    assert.equal(consent.disabled, false, 'checking a session enables restore');
-    assert.match(consent.counted, /1 \/ 4/);
-    await evaluate(`(() => { const button = [...document.querySelectorAll('.dra-modal-foot button')].find((item) => item.textContent.includes('恢复所选')); button?.click(); })()`);
+    console.log('sessions consent', JSON.stringify(consent));
+    assert.equal(consent.checks, 16, 'the stopped parent stays in the all-sessions list');
+    assert.equal(consent.checked, 13, 're-checking the parent raises the indexed count');
+    assert.equal(consent.disabled, false, 'checking a session enables apply');
+    assert.match(consent.counted, /13 \/ 16/);
+    await evaluate(`(() => { const button = [...document.querySelectorAll('.dra-modal-foot button')].find((item) => item.textContent.includes('应用更改')); button?.click(); })()`);
     await waitFor(evaluate, "document.querySelectorAll('.dra-node').length === 13", 8000);
     assert.equal(await evaluate("document.querySelectorAll('.dra-edge').length"), 5);
     await sleep(3400);

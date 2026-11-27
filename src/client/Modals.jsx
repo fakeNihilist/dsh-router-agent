@@ -163,7 +163,7 @@ export function SettingsModal({ settings, models, onSave, onClose }) {
             ariaLabel="跟踪范围"
           />
           <div className="dra-field-help">
-            只跟踪这个范围内有活动的会话；手动恢复或固定的会话始终保留。修改范围不会删除已有索引。
+            只跟踪这个范围内有活动的会话；手动勾选或固定的会话始终保留。修改范围不会删除已有索引。
           </div>
         </div>
         {groups.length === 0 ? <div className="dra-error">没有可用的模型目录，模型设置暂时不可用。</div> : null}
@@ -222,12 +222,23 @@ export function HistoryModal({ ra, history, onOpenRA, onClose }) {
   );
 }
 
-export function UntrackedModal({ items, onRestore, onClose }) {
-  const [selected, setSelected] = useState(() => new Set());
-  const [busy, setBusy] = useState(false);
+export function AllSessionsModal({ items, onApply, onClose }) {
   const list = items ?? [];
-  const chosen = list.filter((item) => selected.has(item.sessionId));
-  const allChecked = list.length > 0 && chosen.length === list.length;
+  const [initial] = useState(
+    () => new Set(list.filter((item) => item.tracked).map((item) => item.sessionId)),
+  );
+  const [selected, setSelected] = useState(() => new Set(initial));
+  const [busy, setBusy] = useState(false);
+  // Checking a Session means "index it"; unchecking means "stop indexing".
+  // Only the difference from the state the dialog opened with is submitted.
+  const track = list
+    .filter((item) => selected.has(item.sessionId) && !initial.has(item.sessionId))
+    .map((item) => item.sessionId);
+  const untrack = list
+    .filter((item) => !selected.has(item.sessionId) && initial.has(item.sessionId))
+    .map((item) => item.sessionId);
+  const changed = track.length + untrack.length;
+  const allChecked = list.length > 0 && selected.size === list.length;
   const toggle = (sessionId, checked) => {
     setSelected((current) => {
       const next = new Set(current);
@@ -239,11 +250,11 @@ export function UntrackedModal({ items, onRestore, onClose }) {
   const toggleAll = () => {
     setSelected(allChecked ? new Set() : new Set(list.map((item) => item.sessionId)));
   };
-  const restore = async () => {
-    if (!chosen.length) return;
+  const apply = async () => {
+    if (!changed) return;
     setBusy(true);
     try {
-      await onRestore?.(chosen.map((item) => item.sessionId));
+      await onApply?.({ track, untrack });
       onClose?.();
     } catch {
       // Parent surfaces the error; keep the ticks so the user can retry.
@@ -252,11 +263,14 @@ export function UntrackedModal({ items, onRestore, onClose }) {
     }
   };
   return (
-    <Mask onClose={onClose} label="未跟踪会话" className="dra-modal-untracked">
-      <Head title="未跟踪会话" onClose={onClose} />
+    <Mask onClose={onClose} label="全部会话" className="dra-modal-sessions">
+      <Head title="全部会话" onClose={onClose} />
       <div className="dra-modal-body">
+        <div className="dra-field-help" style={{ marginBottom: 10 }}>
+          勾选表示纳入 Router 索引；取消勾选会从画布和 RA 上下文移除，不会删除会话本身。
+        </div>
         {list.length === 0 ? (
-          <div className="dra-field-help">没有未跟踪的会话。</div>
+          <div className="dra-field-help">这个项目还没有会话。</div>
         ) : (
           <div className="dra-list">
             {list.map((item) => {
@@ -269,12 +283,18 @@ export function UntrackedModal({ items, onRestore, onClose }) {
                     checked={checked}
                     disabled={busy}
                     onChange={(event) => toggle(item.sessionId, event.target.checked)}
-                    aria-label={`恢复 ${item.title}`}
+                    aria-label={`索引 ${item.title}`}
                   />
                   <div className="dra-grow">
                     <div className="dra-list-title">{item.title}</div>
                     <div className="dra-list-sub">
-                      {item.reason === 'stopped' ? '手动停止跟踪' : '一周前'} · 最后活跃 {item.lastActiveLabel}
+                      {checked
+                        ? '已纳入索引'
+                        : item.reason === 'stopped'
+                          ? '已手动取消索引'
+                          : '超出跟踪范围'}
+                      {Number.isFinite(item.turns) ? ` · ${item.turns} 轮` : ''}
+                      {' · '}最后活跃 {item.lastActiveLabel}
                     </div>
                   </div>
                 </label>
@@ -293,7 +313,7 @@ export function UntrackedModal({ items, onRestore, onClose }) {
           {allChecked ? '取消全选' : '全选'}
         </button>
         <span className="dra-modal-count">
-          已勾选 {chosen.length} / {list.length}
+          已索引 {selected.size} / {list.length}
         </span>
         <span className="dra-spacer" />
         <button className="dra-btn" type="button" onClick={onClose} disabled={busy}>
@@ -302,10 +322,11 @@ export function UntrackedModal({ items, onRestore, onClose }) {
         <button
           className="dra-btn dra-btn-primary"
           type="button"
-          disabled={!chosen.length || busy}
-          onClick={restore}
+          disabled={!changed || busy}
+          title={changed ? `将索引 ${track.length} 个、取消索引 ${untrack.length} 个` : '没有改动'}
+          onClick={apply}
         >
-          {busy ? '恢复中…' : '恢复所选'}
+          {busy ? '应用中…' : '应用更改'}
         </button>
       </div>
     </Mask>
@@ -373,8 +394,8 @@ export function StopModal({ session, onConfirm, onClose }) {
         <div className="dra-list-title">{session.title}</div>
         <div className="dra-field-help" style={{ marginTop: 8 }}>
           停止跟踪后，它会从 RA 的上下文和画布中移除，但会话本身不会被删除。
-          如果它是父会话，跟踪中的子会话会移到顶层继续跟踪；恢复父会话后会自动回挂。
-          之后可以在“未跟踪会话”里恢复。
+          如果它是父会话，跟踪中的子会话会移到顶层继续跟踪；重新勾选父会话后会自动回挂。
+          之后可以在“全部会话”里重新勾选索引。
         </div>
       </div>
       <div className="dra-modal-foot">

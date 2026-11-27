@@ -255,6 +255,31 @@ export class ProjectStore {
     });
   }
 
+  /**
+   * Apply a batch of tracking decisions atomically.
+   *
+   * A checked Session is un-stopped and pinned, so both the tracking window
+   * and an earlier manual stop cannot drop it. An unchecked Session loses its
+   * pin and records a manual stop for the untracked list.
+   */
+  async setTracking({ track = [], untrack = [], parentOf = {} } = {}) {
+    return this.update((state) => {
+      const at = new Date().toISOString();
+      for (const sessionId of track) {
+        delete state.stopped[sessionId];
+        state.pinned[sessionId] = true;
+      }
+      for (const sessionId of untrack) {
+        delete state.pinned[sessionId];
+        state.stopped[sessionId] = {
+          at,
+          reason: 'manual',
+          ...(parentOf[sessionId] ? { parentSessionId: parentOf[sessionId] } : {}),
+        };
+      }
+    });
+  }
+
   async recordLineage(childId, parentId, { pin = false } = {}) {
     if (!parentId && !pin) return;
     return this.update((state) => {

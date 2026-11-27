@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { RouterService } from '../../src/host/router-service.js';
 
 const DAY = 24 * 3600 * 1000;
@@ -62,6 +62,7 @@ async function createHarness() {
   const forks = [];
   const commands = [];
   const permissionSets = [];
+  const createdWorkspaceAttachments = [];
   let nextId = 1;
 
   const addSession = (id, { title, turns = 2, age = 3600_000, parentSessionId = null, blank = false, cwd = project } = {}) => {
@@ -89,6 +90,28 @@ async function createHarness() {
   addSession('c', { title: '子会话', turns: 1, age: 1800_000, parentSessionId: 'p' });
   addSession('old', { title: '旧会话', turns: 1, age: 12 * DAY });
   addSession('other', { title: '旧但已显式恢复', turns: 1, age: 20 * DAY });
+
+  // DSH groups the sidebar by Workspace membership (`sessionIds`), not cwd.
+  // The real registry only attaches when create names a workspaceId.
+  const workspaces = [
+    {
+      id: 'ws-project',
+      path: project,
+      title: '测试项目',
+      sessionIds: [],
+      async attachSession(sessionId) {
+        if (!this.sessionIds.includes(sessionId)) this.sessionIds.unshift(sessionId);
+      },
+    },
+  ];
+  const workspaceRegistry = {
+    list: () => workspaces,
+    get: (id) => workspaces.find((workspace) => workspace.id === id),
+    async resolveByPath(path) {
+      const key = resolve(path).toLowerCase();
+      return workspaces.find((workspace) => resolve(workspace.path).toLowerCase() === key);
+    },
+  };
 
   const projections = new Map();
   const projectionFor = (id) => {
@@ -139,7 +162,7 @@ async function createHarness() {
     systemPrompt: null,
     webServer: null,
     agentPresets: {},
-    workspaceRegistry: null,
+    workspaceRegistry,
   };
 
   const ctx = {
@@ -154,11 +177,14 @@ async function createHarness() {
       async list() {
         return { items: [...summaries.values()] };
       },
-      async create({ cwd, agentPreset }) {
+      async create({ cwd, workspaceId, agentPreset }) {
         const id = `session-new-${nextId++}`;
-        addSession(id, { title: '新会话', turns: 0, age: 0 });
+        const workspace = workspaceId ? workspaceRegistry.get(workspaceId) : null;
+        if (workspaceId) createdWorkspaceAttachments.push({ sessionId: id, workspaceId });
+        addSession(id, { title: '新会话', turns: 0, age: 0, cwd: workspace?.path ?? cwd ?? project });
         summaries.get(id).projections.values.agentPreset = agentPreset ?? 'standard';
-        created.push({ id, cwd, agentPreset });
+        if (workspace) await workspace.attachSession(id);
+        created.push({ id, cwd: workspace?.path ?? cwd, workspaceId, agentPreset });
         makeAgent(id);
         return { sessionId: id, ...(agentPreset ? { agentPreset } : {}) };
       },
@@ -253,6 +279,14 @@ async function createHarness() {
     throw new Error('onboarding did not complete');
   };
 
+  // Tests that patch or delete index output must not race an in-flight run.
+  const waitIndexIdle = async () => {
+    for (let i = 0; i < 200; i += 1) {
+      if (service.indexing.size === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
   return {
     project,
     records,
@@ -260,6 +294,9 @@ async function createHarness() {
     live,
     prompts,
     created,
+    createdWorkspaceAttachments,
+    workspaces,
+    workspaceRegistry,
     forks,
     commands,
     permissionSets,
@@ -269,6 +306,7 @@ async function createHarness() {
     fakeAgent,
     makeAgent,
     waitComplete,
+    waitIndexIdle,
     projectionFor,
     cleanup: () => rm(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }),
   };
@@ -482,65 +520,87 @@ test('first index waits for confirmation and skipping it still allows routing', 
   }
 });
 
-test('manual dispatch creates a normal pending proposal and sends after confirmation', async () => {
+test('manual route executes immediately without leaving a pending proposal', async () => {
   const harness = await createHarness();
   try {
     await harness.waitComplete();
-    const created = await harness.service.manual({
+    const response = await harness.service.manual({
       project: harness.project,
       task: '手动发到父会话',
       action: 'route',
       targetSessionId: 'p',
       composer: { mode: 'standard', permissions: 'workspace-write', auto: true },
     });
-    const store = harness.service.storeFor(harness.project);
-    const proposal = await store.getProposal(created.token);
-    assert.equal(proposal.status, 'pending');
-    assert.equal(proposal.auto, false);
-    assert.equal(proposal.manual, true);
-    await assert.rejects(
-      () => harness.service.retry({ project: harness.project, token: created.token, note: '改一下' }),
-      (error) => error.code === 'manual-proposal',
-    );
-    assert.equal(
-      proposal.targetLastSeq,
-      (await harness.service.findRow(harness.project, 'p')).row.lastSeq,
-    );
-    const result = await harness.service.confirm({ project: harness.project, token: created.token });
-    assert.equal(result.result.result, 'sent');
+    assert.equal(response.result.result, 'sent');
     assert.equal(harness.prompts.at(-1).sessionId, 'p');
     assert.equal(harness.prompts.at(-1).content[0].text, '手动发到父会话');
+    const store = harness.service.storeFor(harness.project);
+    const proposal = await store.getProposal(response.token);
+    assert.equal(proposal.status, 'confirmed');
+    assert.equal(proposal.auto, false);
+    assert.equal(proposal.manual, true);
+    const state = await harness.service.state({ project: harness.project });
+    assert.deepEqual(state.pending, [], 'manual dispatch never waits for confirmation');
+    const history = await store.history(5);
+    assert.equal(history.at(-1).mode, 'manual');
+    assert.equal(history.at(-1).result, 'sent');
   } finally {
     await harness.cleanup();
   }
 });
 
-test('manual fork defaults to the latest boundary and manual retarget moves the target', async () => {
+test('manual fork and new execute immediately with the expected target', async () => {
   const harness = await createHarness();
   try {
     await harness.waitComplete();
-    const created = await harness.service.manual({
+    const parent = (await harness.service.findRow(harness.project, 'p')).row;
+    const forked = await harness.service.manual({
       project: harness.project,
       task: '手动分叉',
       action: 'fork',
       targetSessionId: 'p',
       composer: { mode: 'plan', permissions: 'workspace-write' },
     });
-    const store = harness.service.storeFor(harness.project);
-    let proposal = await store.getProposal(created.token);
-    const parent = (await harness.service.findRow(harness.project, 'p')).row;
-    assert.equal(proposal.atSeq, parent.boundaries.at(-1).atSeq);
-    assert.equal(proposal.turn, parent.boundaries.at(-1).turn);
+    assert.equal(forked.result.result, 'forked');
+    assert.equal(harness.forks.at(-1).atSeq, parent.boundaries.at(-1).atSeq);
+    assert.equal(harness.prompts.at(-1).sessionId, forked.result.sessionId);
+    assert.ok(harness.workspaces[0].sessionIds.includes(forked.result.sessionId));
+
+    const fresh = await harness.service.manual({
+      project: harness.project,
+      task: '手动新建',
+      action: 'new',
+      composer: { mode: 'standard', permissions: 'workspace-write' },
+    });
+    assert.equal(fresh.result.result, 'created');
+    assert.equal(harness.prompts.at(-1).sessionId, fresh.result.sessionId);
+    assert.ok(harness.workspaces[0].sessionIds.includes(fresh.result.sessionId));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('retarget moves a pending RA fork to the new target latest boundary', async () => {
+  const harness = await createHarness();
+  try {
+    await harness.waitComplete();
+    const created = await harness.service.raPropose(harness.fakeAgent, {
+      action: 'fork',
+      task: '换个目标分叉',
+      targetSessionId: 'p',
+      reason: '先选父会话',
+    });
     await harness.service.retarget({
       project: harness.project,
       token: created.token,
       sessionId: 'c',
     });
-    proposal = await store.getProposal(created.token);
+    const proposal = await harness.service.storeFor(harness.project).getProposal(created.token);
     const child = (await harness.service.findRow(harness.project, 'c')).row;
+    assert.equal(proposal.status, 'pending');
     assert.equal(proposal.targetSessionId, 'c');
     assert.equal(proposal.atSeq, child.boundaries.at(-1).atSeq);
-    assert.equal(proposal.composer.mode, 'plan');
+    assert.equal(proposal.turn, child.boundaries.at(-1).turn);
   } finally {
     await harness.cleanup();
   }
@@ -669,6 +729,10 @@ test('fork proposal records atSeq, lineage and the child task', async () => {
     const saved = await store.read();
     assert.equal(saved.lineage[childId], 'c');
     assert.equal(saved.pinned[childId], true);
+    // The DSH sidebar must show the forked child under the project Workspace,
+    // not in「未分组」.
+    const workspace = harness.workspaces[0];
+    assert.ok(workspace.sessionIds.includes(childId), 'fork child must join the Workspace');
     const after = await harness.service.state({ project: harness.project });
     assert.equal(after.tree.sessions.find((row) => row.sessionId === childId).parentSessionId, 'c');
   } finally {
@@ -728,6 +792,7 @@ test('onboarding resumes and skips briefs already built', async () => {
   const harness = await createHarness();
   try {
     await harness.waitComplete();
+    await harness.waitIndexIdle();
     const store = harness.service.storeFor(harness.project);
     await rm(join(harness.project, '.dsh_RA', 'sessions', 'c.json'), { force: true });
     await store.onboarding({
@@ -742,9 +807,11 @@ test('onboarding resumes and skips briefs already built', async () => {
     await harness.service.state({ project: harness.project });
     for (let i = 0; i < 100; i += 1) {
       const state = await harness.service.state({ project: harness.project });
-      if (state.onboarding?.status === 'complete') {
+      // A concurrent collect can still be looking at the pre-delete snapshot
+      // and finish onboarding first; the next state read sees the missing
+      // brief as dirty and schedules it again. Wait for both facts.
+      if (state.onboarding?.status === 'complete' && (await store.getBrief('c'))) {
         assert.equal(state.onboarding.done, 2);
-        assert.ok(await store.getBrief('c'));
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -770,6 +837,11 @@ test('new proposal creates a clean session and applies the model', async () => {
     const result = await harness.service.confirm({ project: harness.project, token: proposal.token });
     assert.equal(result.result.result, 'created');
     assert.equal(harness.created.at(-1).cwd, harness.project);
+    assert.equal(harness.created.at(-1).workspaceId, 'ws-project');
+    assert.ok(
+      harness.workspaces[0].sessionIds.includes(result.result.sessionId),
+      'a Router-created Session must join the project Workspace',
+    );
     assert.equal(harness.prompts.at(-1).content[0].text, '一个全新的任务');
     const summary = harness.summaries.get(result.result.sessionId);
     assert.equal(summary.projections.values.title, '全新任务');
@@ -799,6 +871,116 @@ test('auto mode executes without confirmation and is recorded as auto', async ()
     const rows = await harness.service.storeFor(harness.project).history(10);
     assert.equal(rows.at(-1).mode, 'auto');
     assert.equal(rows.at(-1).result, 'auto');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('the Router session is created inside and repaired into the project Workspace', async () => {
+  const harness = await createHarness();
+  try {
+    await harness.waitComplete();
+    const first = await harness.service.ensureRA(harness.project);
+    assert.equal(first.created, true);
+    assert.equal(harness.created.at(-1).agentPreset, 'router');
+    assert.equal(harness.created.at(-1).workspaceId, 'ws-project');
+    assert.ok(harness.workspaces[0].sessionIds.includes(first.sessionId));
+
+    // Simulate a Router session created by an older version: it exists and is
+    // live but was never a Workspace member. ensureRA repairs it in place.
+    const workspace = harness.workspaces[0];
+    workspace.sessionIds = workspace.sessionIds.filter((id) => id !== first.sessionId);
+    const again = await harness.service.ensureRA(harness.project);
+    assert.equal(again.sessionId, first.sessionId);
+    assert.equal(again.created, false);
+    assert.ok(workspace.sessionIds.includes(first.sessionId), 'existing RA session is reattached');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('raMode reads the Router session plan state without creating one', async () => {
+  const harness = await createHarness();
+  try {
+    const none = await harness.service.raMode({ project: harness.project });
+    assert.equal(none.plan, false);
+    assert.equal(none.sessionId, null);
+    assert.equal(harness.created.length, 0, 'reading the mode never creates an RA session');
+    const ra = await harness.service.ensureRA(harness.project);
+    harness.projectionFor(ra.sessionId).plan = { active: true, pending: false };
+    const on = await harness.service.raMode({ project: harness.project });
+    assert.equal(on.sessionId, ra.sessionId);
+    assert.equal(on.plan, true);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('allSessions lists tracked and untracked rows; tracking applies both directions', async () => {
+  const harness = await createHarness();
+  try {
+    const state = await harness.waitComplete();
+    assert.equal(state.allSessions.length, 4);
+    assert.deepEqual(
+      state.allSessions.filter((item) => item.tracked).map((item) => item.sessionId).sort(),
+      ['c', 'p'],
+    );
+    assert.equal(state.allSessions.find((item) => item.sessionId === 'old').reason, 'older');
+
+    const updated = await harness.service.tracking({
+      project: harness.project,
+      track: ['old'],
+      untrack: ['c'],
+    });
+    assert.deepEqual(updated.tree.sessions.map((row) => row.sessionId).sort(), ['old', 'p']);
+    assert.ok(updated.allSessions.find((item) => item.sessionId === 'old')?.tracked);
+    assert.equal(updated.allSessions.find((item) => item.sessionId === 'c')?.reason, 'stopped');
+    const saved = await harness.service.storeFor(harness.project).read();
+    assert.equal(saved.pinned.old, true);
+    assert.equal(saved.stopped.c.reason, 'manual');
+
+    // Re-checking a manually stopped Session clears the stop and keeps the pin.
+    const restored = await harness.service.tracking({
+      project: harness.project,
+      track: ['c'],
+      untrack: [],
+    });
+    assert.ok(restored.allSessions.find((item) => item.sessionId === 'c')?.tracked);
+    assert.equal((await harness.service.storeFor(harness.project).read()).stopped.c, undefined);
+
+    await assert.rejects(
+      harness.service.tracking({ project: harness.project, track: ['missing'] }),
+      /不在当前项目中/,
+    );
+    await assert.rejects(
+      harness.service.tracking({ project: harness.project, untrack: ['old-missing'] }),
+      /不在跟踪范围内/,
+    );
+    // The legacy untracked view still works for API consumers.
+    const legacy = await harness.service.untracked({ project: harness.project });
+    assert.ok(legacy.items.some((item) => item.sessionId === 'other'));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('opening a project repairs Sessions that were created without a Workspace', async () => {
+  const harness = await createHarness();
+  try {
+    // Simulate the pre-fix state: every Session exists with the project cwd
+    // but none is a Workspace member.
+    harness.workspaces[0].sessionIds = [];
+    await harness.service.state({ project: harness.project });
+    assert.deepEqual(
+      [...harness.workspaces[0].sessionIds].sort(),
+      ['c', 'old', 'other', 'p'],
+      'all non-subagent Sessions in the project directory join the Workspace',
+    );
+    // The repair is one-shot per project; a later read does not reattach a
+    // Session the user moved elsewhere (future DSH versions may expose it).
+    harness.workspaces[0].sessionIds = [];
+    await harness.service.state({ project: harness.project });
+    assert.deepEqual(harness.workspaces[0].sessionIds, []);
   } finally {
     await harness.cleanup();
   }
@@ -1257,6 +1439,7 @@ test('an indexing failure becomes a visible failed onboarding state', async () =
   const harness = await createHarness();
   try {
     await harness.waitComplete();
+    await harness.waitIndexIdle();
     const store = harness.service.storeFor(harness.project);
     const pipeline = harness.service.pipelineFor(harness.project);
     const original = pipeline.indexRows;
